@@ -14,6 +14,12 @@ function required(value: string | undefined, name: string): string {
   return value.trim();
 }
 
+export function getOwnerLoginSecret(env: Pick<AppEnv, "MCP_LOGIN_SECRET">): string {
+  const secret = required(env.MCP_LOGIN_SECRET, "MCP_LOGIN_SECRET");
+  if (secret.length < 32) throw new Error("MCP_LOGIN_SECRET must contain at least 32 characters");
+  return secret;
+}
+
 function port(value: string | undefined, name: string, fallback: number): number {
   const parsed = Number(value ?? fallback);
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
@@ -32,12 +38,4 @@ export function getMailConfig(env: MailSettingsEnv): MailConfig {
     smtpHost: env.SMTP_HOST || "smtp.mail.me.com",
     smtpPort: port(env.SMTP_PORT, "SMTP_PORT", 587),
   };
-}
-
-export function assertAllowedEmail(env: AppEnv, email: string): void {
-  const allowed = required(env.MCP_ALLOWED_EMAIL, "MCP_ALLOWED_EMAIL").toLowerCase();
-  const mailboxOwner = required(env.ICLOUD_EMAIL, "ICLOUD_EMAIL").toLowerCase();
-  if (email.trim().toLowerCase() !== allowed || email.trim().toLowerCase() !== mailboxOwner) {
-    throw new Error("Access identity is not allowlisted");
-  }
 }

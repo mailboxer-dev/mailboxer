@@ -2,13 +2,13 @@
 
 This project is a single, stateless Cloudflare Worker that exposes an authenticated MCP endpoint at `/mcp`. Every mail read, search, mutation, attachment fetch, SMTP delivery, and Sent-mail append uses a fresh live connection to iCloud Mail.
 
-The Worker does not use Durable Objects, D1, R2, a search index, a mailbox cache, or a persistent IMAP/SMTP connection. `OAUTH_KV` is the only persistence: the OAuth provider uses it for clients, short-lived authorization state, grants, access tokens, and refresh tokens. Mail content never enters KV.
+The Worker does not use Durable Objects, D1, R2, a search index, a mailbox cache, or a persistent IMAP/SMTP connection. `OAUTH_KV` is the only persistence: the bundled OAuth provider uses it for clients, short-lived authorization state, grants, access tokens, and refresh tokens. Mail content never enters KV.
 
 ## Runtime and protocol
 
 - IMAP: `imap.mail.me.com:993` over TLS.
 - SMTP: `smtp.mail.me.com:587` with mandatory STARTTLS. Cloudflare Workers does not permit outbound port 25.
-- Authentication: Cloudflare Access for SaaS / OIDC, bridged through `@cloudflare/workers-oauth-provider`.
+- Authentication: a bundled owner-only OAuth authorization page using `@cloudflare/workers-oauth-provider`; no external identity provider is required.
 - MCP: SDK v2 through `createMcpHandler` from `agents/mcp/server`.
 - OAuth scopes: `mail.read`, `mail.write`, and `offline_access` for refresh-token clients.
 - Pagination: descending IMAP UIDs with an explicit `beforeUid` cursor.
@@ -40,9 +40,9 @@ npm run cf-typegen
 cp .dev.vars.example .dev.vars
 ```
 
-Fill `.dev.vars` with the Access/OIDC values and the iCloud account values. Use an Apple app-specific password, not the normal Apple Account password. Apple documents the iCloud Mail settings at [support.apple.com](https://support.apple.com/en-la/102525).
+Fill `.dev.vars` with a randomly generated `MCP_LOGIN_SECRET` and the iCloud account values. Use an Apple app-specific password, not the normal Apple Account password. Apple documents the iCloud Mail settings at [support.apple.com](https://support.apple.com/en-la/102525).
 
-The checked-in Wrangler config contains a zero-valued KV ID so local Miniflare can start. Replace it before any real deployment:
+The checked-in Wrangler config contains a zero-valued KV ID so local Miniflare and the Deploy to Cloudflare template can start. For a manual deployment, create a dedicated namespace and replace the placeholder before deploying:
 
 ```sh
 npx wrangler kv namespace create OAUTH_KV
@@ -61,38 +61,23 @@ The unauthenticated health response is at `http://127.0.0.1:8787/` (Wrangler may
 npx @modelcontextprotocol/inspector http://127.0.0.1:8787/mcp
 ```
 
-## Cloudflare Access and deployment
+## Owner OAuth and deployment
 
-1. Create an Access for SaaS OIDC application for the Worker.
-2. Add `https://<worker-hostname>/callback` as the upstream callback URL.
-3. Copy the Access client ID, client secret, authorization URL, token URL, and JWKS URL.
-4. Set `MCP_ALLOWED_EMAIL` to the exact same address as `ICLOUD_EMAIL`. The callback verifies the ID-token signature, issuer, audience, expiration, OIDC nonce, and this allowlist before creating a grant; mail access is intentionally limited to the configured mailbox owner.
-5. Store secrets with Wrangler. The relevant names are:
+The Worker is its own OAuth authorization server. When ChatGPT or another MCP client follows the protected-resource metadata, it opens `/authorize`. The Worker shows a local consent form, verifies `MCP_LOGIN_SECRET`, and then delegates authorization-code, PKCE, access-token, refresh-token, and revocation handling to `@cloudflare/workers-oauth-provider`.
 
-   - `ACCESS_CLIENT_ID`
-   - `ACCESS_CLIENT_SECRET`
-   - `ACCESS_AUTHORIZATION_URL`
-   - `ACCESS_TOKEN_URL`
-   - `ACCESS_JWKS_URL`
-   - `COOKIE_ENCRYPTION_KEY`
-   - `MCP_ALLOWED_EMAIL`
-   - `ICLOUD_EMAIL`
-   - `ICLOUD_IMAP_USER`
-   - `ICLOUD_APP_PASSWORD`
-
-   For example:
+The deployment login secret is an owner credential, not an iCloud credential and not a user identity. The Worker stores no email identity in OAuth props. Use a high-entropy value and keep it out of Git:
 
 ```sh
-npx wrangler secret put ACCESS_CLIENT_ID
-npx wrangler secret put ACCESS_CLIENT_SECRET
-npx wrangler secret put ACCESS_AUTHORIZATION_URL
-npx wrangler secret put ACCESS_TOKEN_URL
-npx wrangler secret put ACCESS_JWKS_URL
-npx wrangler secret put COOKIE_ENCRYPTION_KEY
-npx wrangler secret put MCP_ALLOWED_EMAIL
+npx wrangler secret put MCP_LOGIN_SECRET
 npx wrangler secret put ICLOUD_EMAIL
 npx wrangler secret put ICLOUD_IMAP_USER
 npx wrangler secret put ICLOUD_APP_PASSWORD
+```
+
+Generate the login secret with:
+
+```sh
+openssl rand -hex 32
 ```
 
 `ICLOUD_IMAP_USER` is commonly the iCloud local part; if Apple requires it for the account, use the full address. SMTP authentication always uses the full `ICLOUD_EMAIL` address in this Worker.
@@ -112,7 +97,19 @@ After replacing the KV ID and setting the secrets, deploy with:
 npx wrangler deploy
 ```
 
-The OAuth provider publishes the standard authorization-server and protected-resource discovery documents. External MCP clients should be given the deployed `/mcp` URL and allowed to complete OAuth with PKCE/S256. Refresh tokens are generated and rotated by the OAuth provider; they are not handled by the mail code.
+The OAuth provider publishes the standard authorization-server and protected-resource discovery documents. In ChatGPT web, add the deployed `/mcp` URL and select **OAuth**; the browser will show the Worker’s login page. Do not select **No Authentication**, because every mail tool is private. Refresh tokens are generated and rotated by the OAuth provider; they are not handled by the mail code.
+
+## One-click Cloudflare deployment
+
+The repository includes Deploy to Cloudflare binding descriptions in `package.json` and a placeholder KV namespace ID. Cloudflare can provision the OAuth KV namespace and present the values from `.dev.vars.example` during deployment. See the [Deploy to Cloudflare documentation](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
+
+The source repository must be public for Cloudflare’s deploy button. Once this repository is published publicly, add this snippet to the project page:
+
+```md
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/<owner>/icloud-mail-mcp)
+```
+
+The deployer still supplies their own iCloud app-specific password and owner login secret. The deployed Worker then works with ChatGPT’s **OAuth** option without creating a separate Access application.
 
 ## Sending and deletion safety
 
@@ -130,7 +127,7 @@ The tests include transcript-backed fake sockets and cover:
 - MIME parsing, transfer decoding, attachment bounds, and header/address injection defenses;
 - SMTP multiline replies, STARTTLS sequencing, authentication, and dot-stuffing;
 - stateless MCP initialization/tool listing without `Mcp-Session-Id`;
-- Access PKCE, nonce-bound state, signed callback cookies, ID-token issuer/signature validation, email allowlisting, per-token scope narrowing, and requested read/offline scopes.
+- owner-only OAuth PKCE, signed one-time state cookies, bounded authorization forms, constant-time login-secret checks, per-token scope narrowing, and requested read/offline scopes.
 
 Live iCloud testing should begin with read-only mailbox listing/search/message fetches. Before enabling general recipients, test `send_email` only to the owner address.
 

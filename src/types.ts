@@ -3,29 +3,23 @@ import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 export const MAIL_SCOPES = ["mail.read", "mail.write"] as const;
 export type MailScope = (typeof MAIL_SCOPES)[number];
 
+export const OWNER_USER_ID = "owner";
+
 export interface MailAuthProps {
   userId: string;
-  email: string;
   scopes: string[];
 }
 
 export function restrictMailPropsToTokenScope(props: unknown, scopes: string[]): MailAuthProps {
   const record = props && typeof props === "object" ? props as Record<string, unknown> : {};
   const userId = typeof record.userId === "string" ? record.userId : "";
-  const email = typeof record.email === "string" ? record.email : "";
   const mailScopes = scopes.filter((scope) => (MAIL_SCOPES as readonly string[]).includes(scope));
-  return { userId, email, scopes: mailScopes };
+  return { userId, scopes: mailScopes };
 }
 
 export type AppEnv = Env & {
   OAUTH_PROVIDER: OAuthHelpers;
-  ACCESS_CLIENT_ID: string;
-  ACCESS_CLIENT_SECRET: string;
-  ACCESS_TOKEN_URL: string;
-  ACCESS_AUTHORIZATION_URL: string;
-  ACCESS_JWKS_URL: string;
-  COOKIE_ENCRYPTION_KEY: string;
-  MCP_ALLOWED_EMAIL: string;
+  MCP_LOGIN_SECRET: string;
   ICLOUD_EMAIL: string;
   ICLOUD_IMAP_USER: string;
   ICLOUD_APP_PASSWORD: string;

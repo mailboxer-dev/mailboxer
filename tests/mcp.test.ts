@@ -12,13 +12,7 @@ function testEnv(): AppEnv {
     IMAP_PORT: "993",
     SMTP_HOST: "smtp.mail.me.com",
     SMTP_PORT: "587",
-    ACCESS_CLIENT_ID: "access-client",
-    ACCESS_CLIENT_SECRET: "access-secret",
-    ACCESS_TOKEN_URL: "https://access.example/token",
-    ACCESS_AUTHORIZATION_URL: "https://access.example/authorize",
-    ACCESS_JWKS_URL: "https://access.example/jwks",
-    COOKIE_ENCRYPTION_KEY: "test-cookie-key",
-    MCP_ALLOWED_EMAIL: "owner@icloud.com",
+    MCP_LOGIN_SECRET: "a-secure-test-login-secret-with-32-chars",
     ICLOUD_EMAIL: "owner@icloud.com",
     ICLOUD_IMAP_USER: "owner",
     ICLOUD_APP_PASSWORD: "app-password",
@@ -27,7 +21,6 @@ function testEnv(): AppEnv {
 
 const props: MailAuthProps = {
   userId: "owner",
-  email: "owner@icloud.com",
   scopes: ["mail.read", "mail.write"],
 };
 

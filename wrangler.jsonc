@@ -14,7 +14,8 @@
   "kv_namespaces": [
     {
       "binding": "OAUTH_KV",
-      "id": "dd49a6cb6f1944c58c73fde5535142e3"
+      // Deploy to Cloudflare provisions a namespace and replaces this placeholder.
+      "id": "00000000000000000000000000000000"
     }
   ],
   "vars": {

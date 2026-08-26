@@ -1,7 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp/server";
-import { accessHandler } from "./access";
+import { ownerAuthHandler } from "./auth";
 import { createMailServer } from "./mail-server";
 import { restrictMailPropsToTokenScope, type AppEnv, type MailAuthProps } from "./types";
 
@@ -23,7 +23,7 @@ export class MailMcpApi extends WorkerEntrypoint<AppEnv, MailAuthProps> {
 export default new OAuthProvider<AppEnv>({
   apiRoute: "/mcp",
   apiHandler: MailMcpApi,
-  defaultHandler: accessHandler,
+  defaultHandler: ownerAuthHandler,
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/oauth/token",
   clientRegistrationEndpoint: "/oauth/register",
