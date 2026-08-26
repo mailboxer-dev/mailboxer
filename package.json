@@ -1,0 +1,35 @@
+{
+  "name": "icloud-mail-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A stateless Cloudflare Workers MCP server for iCloud Mail over IMAP and SMTP.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:dry": "wrangler deploy --dry-run",
+    "cf-typegen": "wrangler types",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.10.3",
+    "@modelcontextprotocol/server": "2.0.0",
+    "agents": "^0.20.1",
+    "postal-mime": "^3.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.1.0",
+    "@eslint/js": "latest",
+    "@types/node": "^26.3.0",
+    "eslint": "latest",
+    "typescript": "latest",
+    "typescript-eslint": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  }
+}

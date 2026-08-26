@@ -1,0 +1,26 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "icloud-mail-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-26",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "global_fetch_strictly_public"
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "dd49a6cb6f1944c58c73fde5535142e3"
+    }
+  ],
+  "vars": {
+    "IMAP_HOST": "imap.mail.me.com",
+    "IMAP_PORT": "993",
+    "SMTP_HOST": "smtp.mail.me.com",
+    "SMTP_PORT": "587"
+  }
+}

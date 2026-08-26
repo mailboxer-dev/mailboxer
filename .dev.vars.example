@@ -1,0 +1,15 @@
+# Cloudflare Access for SaaS / OIDC
+ACCESS_CLIENT_ID=
+ACCESS_CLIENT_SECRET=
+ACCESS_TOKEN_URL=
+ACCESS_AUTHORIZATION_URL=
+ACCESS_JWKS_URL=
+COOKIE_ENCRYPTION_KEY=
+
+# Exact iCloud address that is allowed to use this Worker; keep it equal to ICLOUD_EMAIL.
+MCP_ALLOWED_EMAIL=owner@icloud.com
+
+# iCloud Mail credentials. Use an Apple app-specific password.
+ICLOUD_EMAIL=owner@icloud.com
+ICLOUD_IMAP_USER=owner
+ICLOUD_APP_PASSWORD=
