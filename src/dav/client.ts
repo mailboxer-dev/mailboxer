@@ -109,6 +109,8 @@ export class DavPayloadTooLargeError extends DavProtocolError {
 
 export type DavFetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
+const defaultDavFetcher: DavFetcher = (input, init) => globalThis.fetch(input, init);
+
 interface DavHttpResponse {
   url: string;
   status: number;
@@ -410,7 +412,7 @@ export class DavClient {
   constructor(
     credentials: Pick<MailConfig, "email" | "password">,
     config: DavConfig = getDavConfig({}),
-    fetcher: DavFetcher = fetch,
+    fetcher: DavFetcher = defaultDavFetcher,
   ) {
     this.authHeader = `Basic ${base64(credentials.email, credentials.password)}`;
     this.config = config;

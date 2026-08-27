@@ -57,6 +57,22 @@ const eventRaw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event-a\
 const contactRaw = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-a\r\nFN:Ada Lovelace\r\nN:Lovelace;Ada;;;\r\nEND:VCARD\r\n";
 
 describe("iCloud DAV discovery and live collection access", () => {
+  it("calls the default Worker fetch with the correct receiver", async () => {
+    const responses = calendarBootstrapResponses();
+    const fetcher = vi.fn(function (this: unknown): Promise<Response> {
+      expect(this).toBe(globalThis);
+      const next = responses.shift();
+      if (!next) throw new Error("Transcript exhausted");
+      return Promise.resolve(next);
+    });
+    vi.stubGlobal("fetch", fetcher);
+    try {
+      await expect(new DavClient(credentials, caldavConfig).listCalendars()).resolves.toHaveLength(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("follows only approved HTTPS redirects and discovers CalDAV collections", async () => {
     const transcript = new Transcript(calendarBootstrapResponses());
     const client = new DavClient(credentials, caldavConfig, transcript.fetch);
