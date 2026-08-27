@@ -1,5 +1,7 @@
 import { z } from "zod";
-import { getCredentialsEncryptionSecret, getMailConfig } from "./config";
+import { getCredentialsEncryptionSecret, getDavConfig, getMailConfig } from "./config";
+import { DavClient } from "./dav/client";
+import type { DavService } from "./dav/types";
 import { ImapClient } from "./imap/client";
 import { SmtpClient } from "./smtp/client";
 import { withSpan } from "./tracing";
@@ -8,6 +10,7 @@ import {
   type MailConfig,
   type MailCredentials,
 } from "./types";
+import { CALENDAR_SCOPES, CONTACT_SCOPES, MAIL_SCOPES } from "./types";
 
 const CREDENTIAL_KEY_PREFIX = "mail:credentials:v1:";
 const CREDENTIAL_ID_PREFIX = "icloud-";
@@ -43,6 +46,7 @@ export class MailCredentialError extends Error {
 export interface CredentialVerificationDependencies {
   imapOpen?: typeof ImapClient.open;
   smtpOpen?: typeof SmtpClient.open;
+  davVerify?: (config: MailConfig, service: DavService) => Promise<void>;
 }
 
 function encoder(): TextEncoder {
@@ -197,33 +201,70 @@ async function verifySmtp(config: MailConfig, open: typeof SmtpClient.open): Pro
 export async function verifyMailCredentials(
   env: AppEnv,
   input: unknown,
-  dependencies: CredentialVerificationDependencies = {},
+  scopesOrDependencies: readonly string[] | CredentialVerificationDependencies = MAIL_SCOPES,
+  dependencyOverrides: CredentialVerificationDependencies = {},
 ): Promise<MailCredentials> {
   const submission = normalizeSubmission(input);
+  const scopes: readonly string[] = Array.isArray(scopesOrDependencies) ? scopesOrDependencies : MAIL_SCOPES;
+  const dependencies: CredentialVerificationDependencies = Array.isArray(scopesOrDependencies)
+    ? dependencyOverrides
+    : scopesOrDependencies as CredentialVerificationDependencies;
+  const mailReadRequested = scopes.includes("mail.read");
+  const mailWriteRequested = scopes.includes("mail.write");
+  const mailRequested = mailReadRequested || mailWriteRequested;
+  const calendarRequested = scopes.some((scope) => (CALENDAR_SCOPES as readonly string[]).includes(scope));
+  const contactsRequested = scopes.some((scope) => (CONTACT_SCOPES as readonly string[]).includes(scope));
+  if (!mailRequested && !calendarRequested && !contactsRequested) {
+    throw new MailCredentialError("Select at least one supported iCloud permission");
+  }
   const imapOpen = dependencies.imapOpen ?? ImapClient.open;
   const smtpOpen = dependencies.smtpOpen ?? SmtpClient.open;
-  let verifiedConfig: MailConfig | undefined;
+  const davVerify = dependencies.davVerify ?? ((config: MailConfig, service: DavService) => (
+    new DavClient(config, getDavConfig(env)).verifyService(service)
+  ));
+  let verifiedConfig = getMailConfig(env, {
+    email: submission.email,
+    imapUser: imapUserCandidates(submission.email)[0] ?? submission.email,
+    appPassword: submission.appPassword,
+  });
 
-  for (const [index, imapUser] of imapUserCandidates(submission.email).entries()) {
-    const config = getMailConfig(env, {
-      email: submission.email,
-      imapUser,
-      appPassword: submission.appPassword,
-    });
-    try {
-      await verifyImap(config, imapOpen, index + 1);
-      verifiedConfig = config;
-      break;
-    } catch {
-      // Apple accepts either the local part or, for some accounts, the full address.
+  if (mailRequested) {
+    let imapVerified = false;
+    for (const [index, imapUser] of imapUserCandidates(submission.email).entries()) {
+      const config = getMailConfig(env, {
+        email: submission.email,
+        imapUser,
+        appPassword: submission.appPassword,
+      });
+      try {
+        await verifyImap(config, imapOpen, index + 1);
+        verifiedConfig = config;
+        imapVerified = true;
+        break;
+      } catch {
+        // Apple accepts either the local part or, for some accounts, the full address.
+      }
+    }
+
+    if (!imapVerified) throw new MailCredentialError("iCloud credentials could not be verified");
+    if (mailWriteRequested) {
+      try {
+        await verifySmtp(verifiedConfig, smtpOpen);
+      } catch {
+        throw new MailCredentialError("iCloud SMTP credentials could not be verified");
+      }
     }
   }
 
-  if (!verifiedConfig) throw new MailCredentialError("iCloud credentials could not be verified");
-  try {
-    await verifySmtp(verifiedConfig, smtpOpen);
-  } catch {
-    throw new MailCredentialError("iCloud SMTP credentials could not be verified");
+  for (const service of [
+    ...(calendarRequested ? ["calendar" as const] : []),
+    ...(contactsRequested ? ["contacts" as const] : []),
+  ]) {
+    try {
+      await davVerify(verifiedConfig, service);
+    } catch {
+      throw new MailCredentialError("iCloud DAV credentials could not be verified");
+    }
   }
   return {
     email: verifiedConfig.email,

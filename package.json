@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A stateless Cloudflare Workers MCP server for iCloud Mail over IMAP and SMTP.",
+  "description": "A stateless Cloudflare Workers MCP server for iCloud Mail, Calendar, and Contacts over IMAP, SMTP, CalDAV, and CardDAV.",
   "scripts": {
     "dev": "wrangler dev",
     "start": "wrangler dev",

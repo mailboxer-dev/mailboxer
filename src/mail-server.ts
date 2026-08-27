@@ -1,10 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { MailCredentialError, getMailConfigForCredential } from "./credentials";
-import { ImapProtocolError, MessageTooLargeError, withImapConfig, type ImapClient } from "./imap/client";
+import { getMailConfigForCredential } from "./credentials";
+import { MessageTooLargeError, withImapConfig, type ImapClient } from "./imap/client";
 import { parseRfc822, decodeContentTransfer, encodeBase64 } from "./mime";
-import { SmtpClient, SmtpProtocolError } from "./smtp/client";
-import { withSpan } from "./tracing";
+import { SmtpClient } from "./smtp/client";
+import { registerDavTools } from "./dav-server";
+import { publicError, requireScope, textResult, withToolSpan } from "./mcp-helpers";
 import {
   DEFAULT_PAGE_SIZE,
   MAX_ATTACHMENT_BYTES,
@@ -35,22 +36,6 @@ const mailboxSchema = z.string().min(1).max(MAILBOX_LIMIT);
 const uidSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 const uidListSchema = z.array(uidSchema).min(1).max(MAX_UIDS_PER_MUTATION);
 
-function textResult(value: unknown, isError = false): { content: [{ type: "text"; text: string }]; isError?: boolean } {
-  return {
-    content: [{ type: "text", text: JSON.stringify(value) }],
-    ...(isError ? { isError: true } : {}),
-  };
-}
-
-function publicError(error: unknown): string {
-  if (error instanceof MessageTooLargeError) return error.message;
-  if (error instanceof ImapProtocolError || error instanceof SmtpProtocolError) return error.message;
-  if (error instanceof MailCredentialError) return error.message;
-  if (error instanceof Error && error.message.startsWith("Missing Worker")) return "Mail credentials are not configured";
-  if (error instanceof z.ZodError) return "Input failed validation";
-  return "Mail operation failed";
-}
-
 function safeUidList(values: number[]): number[] {
   return [...new Set(uidListSchema.parse(values))];
 }
@@ -63,16 +48,6 @@ function safeFlags(flags: string[]): string[] {
     if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(flag)) return flag;
     throw new Error("Invalid IMAP flag");
   });
-}
-
-function requireScope(props: MailAuthProps, scope: "mail.read" | "mail.write"): void {
-  if (!props?.userId || props.userId !== props.credentialId || !props.credentialId || !props.scopes.includes(scope)) {
-    throw new Error(`Missing required scope: ${scope}`);
-  }
-}
-
-function withToolSpan<T>(name: string, operation: () => Promise<T>): Promise<T> {
-  return withSpan(`mcp.tool.${name}`, { "mcp.tool.name": name }, operation);
 }
 
 async function withUserImap<T>(env: AppEnv, props: MailAuthProps, operation: (imap: ImapClient) => Promise<T>): Promise<T> {
@@ -367,6 +342,8 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     }),
   );
 
+  registerDavTools(server, env, props);
+
   return server;
 }
 
@@ -380,4 +357,16 @@ export const TOOL_NAMES = [
   "move_messages",
   "delete_messages",
   "send_email",
+  "list_calendars",
+  "list_calendar_items",
+  "get_calendar_item",
+  "create_calendar_item",
+  "update_calendar_item",
+  "delete_calendar_item",
+  "list_address_books",
+  "list_contacts",
+  "get_contact",
+  "create_contact",
+  "update_contact",
+  "delete_contact",
 ] as const;

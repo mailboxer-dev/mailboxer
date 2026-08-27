@@ -44,6 +44,8 @@ function env(credentialsKv: MemoryKv, key = encryptionKey): AppEnv {
     IMAP_PORT: "993",
     SMTP_HOST: "smtp.mail.me.com",
     SMTP_PORT: "587",
+    CALDAV_URL: "https://caldav.icloud.com/",
+    CARDDAV_URL: "https://contacts.icloud.com/",
     MAIL_CREDENTIALS_ENCRYPTION_KEY: key,
   };
 }
@@ -148,5 +150,49 @@ describe("encrypted iCloud credential storage", () => {
     }, { imapOpen: failingOpen as unknown as typeof ImapClient.open })).rejects.toEqual(
       new MailCredentialError("iCloud credentials could not be verified"),
     );
+  });
+
+  it("verifies only the services requested by a calendar-only grant", async () => {
+    const environment = env(new MemoryKv());
+    const imapOpen = vi.fn(async () => { throw new Error("IMAP must not be contacted"); });
+    const smtpOpen = vi.fn(async () => { throw new Error("SMTP must not be contacted"); });
+    const davVerify = vi.fn(async (_config: MailConfig, service: "calendar" | "contacts") => {
+      expect(service).toBe("calendar");
+    });
+    await expect(verifyMailCredentials(
+      environment,
+      { email: "owner@icloud.com", appPassword: "abcd-efgh-ijkl-mnop" },
+      ["calendar.read"],
+      {
+        imapOpen: imapOpen as unknown as typeof ImapClient.open,
+        smtpOpen: smtpOpen as unknown as typeof SmtpClient.open,
+        davVerify,
+      },
+    )).resolves.toEqual({
+      email: "owner@icloud.com",
+      imapUser: "owner",
+      appPassword: "abcd-efgh-ijkl-mnop",
+    });
+    expect(imapOpen).not.toHaveBeenCalled();
+    expect(smtpOpen).not.toHaveBeenCalled();
+    expect(davVerify).toHaveBeenCalledOnce();
+  });
+
+  it("does not probe SMTP for a read-only mail grant", async () => {
+    const environment = env(new MemoryKv());
+    const imapClose = vi.fn();
+    const imapOpen = vi.fn(async () => ({ close: imapClose }));
+    const smtpOpen = vi.fn(async () => { throw new Error("SMTP must not be contacted"); });
+    await expect(verifyMailCredentials(
+      environment,
+      { email: "owner@icloud.com", appPassword: "abcd-efgh-ijkl-mnop" },
+      ["mail.read"],
+      {
+        imapOpen: imapOpen as unknown as typeof ImapClient.open,
+        smtpOpen: smtpOpen as unknown as typeof SmtpClient.open,
+      },
+    )).resolves.toMatchObject({ email: "owner@icloud.com" });
+    expect(imapOpen).toHaveBeenCalledOnce();
+    expect(smtpOpen).not.toHaveBeenCalled();
   });
 });

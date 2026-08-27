@@ -4,9 +4,9 @@ import { createMcpHandler } from "agents/mcp/server";
 import { credentialAuthHandler } from "./auth";
 import { createMailServer } from "./mail-server";
 import { withSpan } from "./tracing";
-import { restrictMailPropsToTokenScope, type AppEnv, type MailAuthProps } from "./types";
+import { restrictPropsToTokenScope, RESOURCE_SCOPES, type AppEnv, type AuthProps } from "./types";
 
-export class MailMcpApi extends WorkerEntrypoint<AppEnv, MailAuthProps> {
+export class MailMcpApi extends WorkerEntrypoint<AppEnv, AuthProps> {
   fetch(request: Request): Promise<Response> {
     const props = this.ctx.props;
     const handler = createMcpHandler(
@@ -35,16 +35,16 @@ export default new OAuthProvider<AppEnv>({
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/oauth/token",
   clientRegistrationEndpoint: "/oauth/register",
-  scopesSupported: ["mail.read", "mail.write", "offline_access"],
+  scopesSupported: [...RESOURCE_SCOPES, "offline_access"],
   allowPlainPKCE: false,
   refreshTokenTTL: 30 * 24 * 60 * 60,
   tokenExchangeCallback: async ({ props, requestedScope }) => ({
-    accessTokenProps: restrictMailPropsToTokenScope(props, requestedScope),
+    accessTokenProps: restrictPropsToTokenScope(props, requestedScope),
   }),
   clientIdMetadataDocumentEnabled: true,
   resourceMetadata: {
-    scopes_supported: ["mail.read", "mail.write"],
+    scopes_supported: [...RESOURCE_SCOPES],
     bearer_methods_supported: ["header"],
-    resource_name: "iCloud Mail MCP server",
+    resource_name: "iCloud Mail, Calendar, and Contacts MCP server",
   },
 });

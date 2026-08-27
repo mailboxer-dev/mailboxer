@@ -10,6 +10,8 @@ const env = {
   IMAP_PORT: "993",
   SMTP_HOST: "smtp.mail.me.com",
   SMTP_PORT: "587",
+  CALDAV_URL: "https://caldav.icloud.com/",
+  CARDDAV_URL: "https://contacts.icloud.com/",
 } as unknown as AppEnv;
 
 const context = {} as unknown as ExecutionContext;
@@ -28,7 +30,7 @@ describe("OAuth provider discovery", () => {
     expect(await protectedResource.json()).toMatchObject({
       resource: "https://mcp.example/mcp",
       authorization_servers: ["https://mcp.example"],
-      scopes_supported: ["mail.read", "mail.write"],
+      scopes_supported: ["mail.read", "mail.write", "calendar.read", "calendar.write", "contacts.read", "contacts.write"],
     });
 
     const authorizationServer = await worker.fetch(

@@ -3,19 +3,32 @@ import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 export const MAIL_SCOPES = ["mail.read", "mail.write"] as const;
 export type MailScope = (typeof MAIL_SCOPES)[number];
 
-export interface MailAuthProps {
+export const CALENDAR_SCOPES = ["calendar.read", "calendar.write"] as const;
+export type CalendarScope = (typeof CALENDAR_SCOPES)[number];
+
+export const CONTACT_SCOPES = ["contacts.read", "contacts.write"] as const;
+export type ContactScope = (typeof CONTACT_SCOPES)[number];
+
+export const RESOURCE_SCOPES = [...MAIL_SCOPES, ...CALENDAR_SCOPES, ...CONTACT_SCOPES] as const;
+export type ResourceScope = (typeof RESOURCE_SCOPES)[number];
+
+export interface AuthProps {
   userId: string;
   credentialId: string;
   scopes: string[];
 }
 
-export function restrictMailPropsToTokenScope(props: unknown, scopes: string[]): MailAuthProps {
+export type MailAuthProps = AuthProps;
+
+export function restrictPropsToTokenScope(props: unknown, scopes: string[]): AuthProps {
   const record = props && typeof props === "object" ? props as Record<string, unknown> : {};
   const userId = typeof record.userId === "string" ? record.userId : "";
   const credentialId = typeof record.credentialId === "string" ? record.credentialId : "";
-  const mailScopes = scopes.filter((scope) => (MAIL_SCOPES as readonly string[]).includes(scope));
-  return { userId, credentialId, scopes: mailScopes };
+  const resourceScopes = scopes.filter((scope) => (RESOURCE_SCOPES as readonly string[]).includes(scope));
+  return { userId, credentialId, scopes: resourceScopes };
 }
+
+export const restrictMailPropsToTokenScope = restrictPropsToTokenScope;
 
 export type AppEnv = Env & {
   OAUTH_PROVIDER: OAuthHelpers;
@@ -33,6 +46,11 @@ export interface MailConfig {
   imapPort: number;
   smtpHost: string;
   smtpPort: number;
+}
+
+export interface DavConfig {
+  caldavUrl: string;
+  carddavUrl: string;
 }
 
 export interface MailCredentials {

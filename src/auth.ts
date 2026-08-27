@@ -9,14 +9,14 @@ import {
   storeMailCredentials,
   verifyMailCredentials,
 } from "./credentials";
-import { MAIL_SCOPES, type MailCredentials, type OAuthEnv } from "./types";
+import { RESOURCE_SCOPES, type MailCredentials, type OAuthEnv } from "./types";
 
 const AUTH_STATE_TTL_SECONDS = 600;
 const MAX_AUTH_ATTEMPTS = 5;
 const MAX_FORM_BYTES = 16 * 1024;
 const STATE_KEY_PREFIX = "mail-oauth:state:";
 const STATE_COOKIE_NAME = "mcp_oauth_state";
-const AUTH_SCOPES = [...MAIL_SCOPES, "offline_access"] as const;
+const AUTH_SCOPES = [...RESOURCE_SCOPES, "offline_access"] as const;
 
 interface StoredAuthState {
   request: AuthRequest;
@@ -25,7 +25,7 @@ interface StoredAuthState {
 }
 
 export interface CredentialAuthDependencies {
-  verifyCredentials?: (env: OAuthEnv, input: unknown) => Promise<MailCredentials>;
+  verifyCredentials?: (env: OAuthEnv, input: unknown, scopes: readonly string[]) => Promise<MailCredentials>;
   storeCredentials?: (env: OAuthEnv, credentials: MailCredentials) => Promise<string>;
 }
 
@@ -180,13 +180,17 @@ function requestedScopes(request: AuthRequest): Array<(typeof AUTH_SCOPES)[numbe
   return AUTH_SCOPES.filter((scope) => request.scope.includes(scope));
 }
 
-function mailScopes(scopes: readonly string[]): string[] {
-  return scopes.filter((scope) => (MAIL_SCOPES as readonly string[]).includes(scope));
+function resourceScopes(scopes: readonly string[]): string[] {
+  return scopes.filter((scope) => (RESOURCE_SCOPES as readonly string[]).includes(scope));
 }
 
 function scopeLabel(scope: (typeof AUTH_SCOPES)[number]): string {
   if (scope === "mail.read") return "Read and search mail, messages, and attachments";
   if (scope === "mail.write") return "Change flags, move/delete messages, and send mail";
+  if (scope === "calendar.read") return "Read calendars, events, and reminders";
+  if (scope === "calendar.write") return "Create, update, and delete calendar events and reminders";
+  if (scope === "contacts.read") return "Read contacts and address books";
+  if (scope === "contacts.write") return "Create, update, and delete contacts";
   return "Keep the connection active with refresh tokens";
 }
 
@@ -208,7 +212,7 @@ function renderLoginPage(
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Authorize iCloud Mail MCP</title>
+    <title>Authorize iCloud MCP</title>
     <style>
       :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
       body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f6f8; color: #172033; }
@@ -230,7 +234,7 @@ function renderLoginPage(
   </head>
   <body>
     <main>
-      <h1>Authorize iCloud Mail MCP</h1>
+      <h1>Authorize iCloud MCP</h1>
       <p><strong>${escapeHtml(stored.clientName || "MCP client")}</strong> is requesting access to this Worker.</p>
       ${error}
       <form method="post" action="/authorize">
@@ -241,7 +245,7 @@ function renderLoginPage(
         <input id="icloud_email" name="icloud_email" type="email" autocomplete="username" maxlength="320" value="${escapeHtml(emailValue.slice(0, 320))}" required>
         <label for="icloud_app_password">Apple app-specific password</label>
         <input id="icloud_app_password" name="icloud_app_password" type="password" autocomplete="current-password" maxlength="256" required>
-        <p class="hint">Use an Apple app-specific password, not your normal Apple Account password. The Worker verifies it against iCloud and stores it encrypted.</p>
+        <p class="hint">Use an Apple app-specific password, not your normal Apple Account password. The Worker verifies the requested iCloud services and stores the credentials encrypted.</p>
         <div class="actions">
           <button type="submit" name="decision" value="deny">Cancel</button>
           <button type="submit" name="decision" value="approve">Authorize</button>
@@ -322,8 +326,8 @@ async function beginCredentialAuthorization(request: Request, env: OAuthEnv): Pr
   if (oauthRequest.codeChallengeMethod !== "S256" || !oauthRequest.codeChallenge) {
     return errorRedirect(oauthRequest, "invalid_request", "PKCE S256 is required");
   }
-  if (!mailScopes(requestedScopes(oauthRequest)).length) {
-    return errorRedirect(oauthRequest, "invalid_scope", "Request mail.read or mail.write");
+  if (!resourceScopes(requestedScopes(oauthRequest)).length) {
+    return errorRedirect(oauthRequest, "invalid_scope", "Request at least one supported iCloud permission");
   }
 
   assertCredentialConfiguration(env);
@@ -372,10 +376,10 @@ async function completeCredentialAuthorization(
 
   const selectedScopes = new Set(form.getAll("scope"));
   const grantedScopes = requestedScopes(stored.request).filter((scope) => selectedScopes.has(scope));
-  const grantedMailScopes = mailScopes(grantedScopes);
-  if (!grantedMailScopes.length) {
+  const grantedResourceScopes = resourceScopes(grantedScopes);
+  if (!grantedResourceScopes.length) {
     return htmlResponse(
-      renderLoginPage(stateToken, stored, "Select at least one mail permission.", form.get("icloud_email") ?? ""),
+      renderLoginPage(stateToken, stored, "Select at least one iCloud permission.", form.get("icloud_email") ?? ""),
       400,
       stateCookie(request, stateToken, cookieSignature),
     );
@@ -385,7 +389,7 @@ async function completeCredentialAuthorization(
   const appPassword = form.get("icloud_app_password") ?? "";
   let credentials: MailCredentials;
   try {
-    credentials = await dependencies.verifyCredentials(env, { email, appPassword });
+    credentials = await dependencies.verifyCredentials(env, { email, appPassword }, grantedResourceScopes);
   } catch (error) {
     if (!(error instanceof MailCredentialError)) throw error;
     const attempts = stored.attempts + 1;
@@ -415,7 +419,7 @@ async function completeCredentialAuthorization(
   const props = {
     userId: credentialId,
     credentialId,
-    scopes: grantedMailScopes,
+    scopes: grantedResourceScopes,
   };
   const result = await env.OAUTH_PROVIDER.completeAuthorization({
     request: stored.request,
@@ -438,7 +442,7 @@ function isCredentialConfigurationError(error: unknown): boolean {
 
 export function createCredentialAuthHandler(dependencies: CredentialAuthDependencies = {}): ExportedHandler<OAuthEnv> {
   const resolved: Required<CredentialAuthDependencies> = {
-    verifyCredentials: dependencies.verifyCredentials ?? ((env, input) => verifyMailCredentials(env, input)),
+    verifyCredentials: dependencies.verifyCredentials ?? ((env, input, scopes) => verifyMailCredentials(env, input, scopes)),
     storeCredentials: dependencies.storeCredentials ?? storeMailCredentials,
   };
   return {

@@ -1,18 +1,35 @@
 import { createMcpHandler } from "agents/mcp/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import { storeMailCredentials } from "../src/credentials";
 import { createMailServer, TOOL_NAMES } from "../src/mail-server";
 import type { AppEnv, MailAuthProps } from "../src/types";
 
-function testEnv(): AppEnv {
+class MemoryKv {
+  private readonly values = new Map<string, string>();
+
+  async put(key: string, value: string): Promise<void> {
+    this.values.set(key, value);
+  }
+
+  async get(key: string, type?: "json"): Promise<unknown> {
+    const value = this.values.get(key);
+    if (value === undefined) return null;
+    return type === "json" ? JSON.parse(value) as unknown : value;
+  }
+}
+
+function testEnv(credentialsKv: KVNamespace = {} as KVNamespace): AppEnv {
   return {
     OAUTH_KV: {} as KVNamespace,
-    MAIL_CREDENTIALS_KV: {} as KVNamespace,
+    MAIL_CREDENTIALS_KV: credentialsKv,
     OAUTH_PROVIDER: {} as OAuthHelpers,
     IMAP_HOST: "imap.mail.me.com",
     IMAP_PORT: "993",
     SMTP_HOST: "smtp.mail.me.com",
     SMTP_PORT: "587",
+    CALDAV_URL: "https://caldav.icloud.com/",
+    CARDDAV_URL: "https://contacts.icloud.com/",
     MAIL_CREDENTIALS_ENCRYPTION_KEY: "a-secure-test-encryption-key-with-32-chars",
   };
 }
@@ -34,7 +51,7 @@ function context(): ExecutionContext {
   } as unknown as ExecutionContext;
 }
 
-async function rpc(handler: ReturnType<typeof createMcpHandler>, body: unknown): Promise<Response> {
+async function rpc(handler: ReturnType<typeof createMcpHandler>, body: unknown, environment = testEnv()): Promise<Response> {
   return handler(
     new Request("https://mcp.example/mcp", {
       method: "POST",
@@ -44,7 +61,7 @@ async function rpc(handler: ReturnType<typeof createMcpHandler>, body: unknown):
       },
       body: JSON.stringify(body),
     }),
-    testEnv(),
+    environment,
     context(),
   );
 }
@@ -75,6 +92,79 @@ describe("stateless MCP handler", () => {
     expect(tools.headers.get("Mcp-Session-Id")).toBeNull();
     const listing = await sseJson(tools) as { result?: { tools?: Array<{ name: string }> } };
     expect(listing.result?.tools?.map((tool) => tool.name)).toEqual([...TOOL_NAMES]);
+  });
+
+  it("advertises DAV tool annotations and enforces dedicated scopes", async () => {
+    const handler = createMcpHandler(
+      () => createMailServer(testEnv(), props),
+      { route: "/mcp", legacy: "stateless", authContext: { props: { ...props } } },
+    );
+    const listing = await sseJson(await rpc(handler, { jsonrpc: "2.0", id: 3, method: "tools/list", params: {} })) as {
+      result?: { tools?: Array<{ name: string; annotations?: Record<string, unknown> }> };
+    };
+    const tools = listing.result?.tools ?? [];
+    expect(tools.find((tool) => tool.name === "list_calendars")?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+    expect(tools.find((tool) => tool.name === "create_calendar_item")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false });
+    expect(tools.find((tool) => tool.name === "delete_contact")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+
+    const mailOnlyHandler = createMcpHandler(
+      () => createMailServer(testEnv(), props),
+      { route: "/mcp", legacy: "stateless", authContext: { props: { ...props, scopes: ["mail.read"] } } },
+    );
+    const denied = await sseJson(await rpc(mailOnlyHandler, {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "list_calendars", arguments: {} },
+    })) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } };
+    expect(denied.result?.isError).toBe(true);
+    expect(denied.result?.content?.[0]?.text).toContain("Missing required scope: calendar.read");
+  });
+
+  it("invokes a DAV tool through the stateless handler with the encrypted credential record", async () => {
+    const credentialsKv = new MemoryKv();
+    const environment = testEnv(credentialsKv as unknown as KVNamespace);
+    const credentialId = await storeMailCredentials(environment, {
+      email: "owner@icloud.com",
+      imapUser: "owner",
+      appPassword: "app-password",
+    });
+    const userProps: MailAuthProps = {
+      userId: credentialId,
+      credentialId,
+      scopes: ["calendar.read"],
+    };
+    const responses = [
+      new Response(`<d:multistatus xmlns:d="DAV:"><d:response><d:href>/principal/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/principal/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`),
+      new Response(`<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/principal/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/calendars/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`),
+      new Response(`<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/calendars/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype><d:displayname>Personal</d:displayname></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`),
+    ];
+    const fetchMock = vi.fn(async () => {
+      const next = responses.shift();
+      if (!next) throw new Error("DAV transcript exhausted");
+      return next;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const handler = createMcpHandler(
+        () => createMailServer(environment, userProps),
+        { route: "/mcp", legacy: "stateless", authContext: { props: { ...userProps } } },
+      );
+      const response = await rpc(handler, {
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: { name: "list_calendars", arguments: {} },
+      }, environment);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("Mcp-Session-Id")).toBeNull();
+      const result = await sseJson(response) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } };
+      expect(result.result?.isError).not.toBe(true);
+      expect(result.result?.content?.[0]?.text).toContain("Personal");
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

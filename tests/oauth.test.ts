@@ -69,6 +69,8 @@ function oauthEnv(
     IMAP_PORT: "993",
     SMTP_HOST: "smtp.mail.me.com",
     SMTP_PORT: "587",
+    CALDAV_URL: "https://caldav.icloud.com/",
+    CARDDAV_URL: "https://contacts.icloud.com/",
     MAIL_CREDENTIALS_ENCRYPTION_KEY: encryptionKey,
   };
 }
@@ -161,7 +163,7 @@ describe("iCloud credential OAuth authorization", () => {
     const response = await authFetch(form, env, context());
     expect(response.status).toBe(401);
     expect(await response.text()).toContain("could not be verified");
-    expect(verifyCredentials).toHaveBeenCalledWith(env, { email: "owner@icloud.com", appPassword: "app-password" });
+    expect(verifyCredentials).toHaveBeenCalledWith(env, { email: "owner@icloud.com", appPassword: "app-password" }, ["mail.read"]);
     expect(storeCredentials).not.toHaveBeenCalled();
     expect(kv.keys()).toHaveLength(1);
   });
