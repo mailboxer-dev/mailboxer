@@ -13,7 +13,7 @@ The Worker does not use Durable Objects, D1, R2, a search index, a mailbox/calen
 - iCloud preset CalDAV: `https://caldav.icloud.com/` over HTTPS, with bounded principal/home-set/collection discovery and `PROPFIND`/`REPORT`/`GET`/`PUT`/`DELETE` requests.
 - iCloud preset CardDAV: `https://contacts.icloud.com/` over HTTPS, with the same request-local discovery and bounds.
 - Custom mail providers: IMAP `993` with implicit TLS or `143` with mandatory STARTTLS; SMTP `465` with implicit TLS or `587`/`2525` with mandatory STARTTLS. Hostnames are validated and port 25 is rejected. Custom providers do not supply CalDAV or CardDAV endpoints.
-- Authentication: a bundled OAuth authorization page using `@cloudflare/workers-oauth-provider`; no external identity provider is required. The page creates or manages account profiles, collects the selected provider credentials, verifies the services enabled for each account, and stores the credentials encrypted in `MAIL_CREDENTIALS_KV`.
+- Authentication: a bundled OAuth server using `@cloudflare/workers-oauth-provider`; no external identity provider is required. Its React/shadcn authorization UI creates or manages account profiles, collects the selected provider credentials, verifies enabled services, and stores credentials encrypted in `MAIL_CREDENTIALS_KV`. Permissions are not shown as a second consent step: every supported scope requested by the OAuth client is granted automatically.
 - MCP: SDK v2 through `createMcpHandler` from `agents/mcp/server`.
 - OAuth scopes: `mail.read`, `mail.write`, `calendar.read`, `calendar.write`, `contacts.read`, `contacts.write`, and `offline_access` for refresh-token clients.
 - Pagination: descending IMAP UIDs with an explicit `beforeUid` cursor.
@@ -55,7 +55,9 @@ All write tools are annotated as non-read-only MCP actions. `send_email` reports
 
 ## Accounts and providers
 
-The OAuth wizard has two entry points: create a new profile during initial authorization, or manage the existing profile when the MCP client reconnects. Reconnect is the sole account-management entry point. It can add, edit, test, remove, and choose the default account; it cannot remove the final account. The MCP surface exposes account selection and account metadata only, not account credentials or management actions.
+The OAuth wizard starts by asking which email address to configure. It recognizes `icloud.com`, `me.com`, and `mac.com` addresses as iCloud accounts and otherwise opens the custom IMAP/SMTP form; the provider can be overridden for custom-domain iCloud accounts. After the submitted credentials are verified, the Worker securely looks up the corresponding encrypted profile. It opens account management when that account already exists and starts a new profile when it does not. This avoids exposing account existence before credential verification.
+
+Reconnect is the account-management entry point after authorization. It can add, edit, test, remove, and choose the default account; it cannot remove the final account. The MCP surface exposes account selection and account metadata only, not account credentials or management actions.
 
 The iCloud preset uses an Apple app-specific password and provides the iCloud Mail, Calendar, and Contacts services. Its mail endpoints and DAV services are fixed to the iCloud service defaults documented above. Capabilities can be enabled per account, but a capability also requires the corresponding OAuth scope (`mail.*`, `calendar.*`, or `contacts.*`) in the current grant.
 
@@ -85,7 +87,7 @@ The checked-in Wrangler config intentionally contains no account-specific KV IDs
 Start the Worker:
 
 ```sh
-npx wrangler dev
+npm run dev
 ```
 
 The unauthenticated health response is at `http://127.0.0.1:8787/` (Wrangler may choose another port). `/mcp` is protected and requires the OAuth configuration below. MCP Inspector can connect to the endpoint with:
@@ -96,7 +98,7 @@ npx @modelcontextprotocol/inspector http://127.0.0.1:8787/mcp
 
 ## OAuth and deployment
 
-The Worker is its own OAuth authorization server. When ChatGPT or another MCP client follows the protected-resource metadata, it opens `/authorize`. The Worker shows a local consent form, lets the user create or manage the selected account profiles, verifies the services enabled for each account, encrypts the resulting account vault, and then delegates authorization-code, PKCE, access-token, refresh-token, and revocation handling to `@cloudflare/workers-oauth-provider`. The form shows the scopes requested by the client; reconnect or reauthorize after the client refreshes its OAuth metadata to request newly added scopes, because refresh tokens cannot widen an existing grant.
+The Worker is its own OAuth authorization server. When ChatGPT or another MCP client follows the protected-resource metadata, it opens `/authorize`. The React setup screen asks for an email address first, detects the likely provider, verifies the enabled services, and automatically opens the matching profile or starts a new one. It encrypts the resulting account vault and then delegates authorization-code, PKCE, access-token, refresh-token, and revocation handling to `@cloudflare/workers-oauth-provider`. The page does not expose permission controls: the Worker grants every supported scope included in the client's authorization request. Reconnect or reauthorize after the client refreshes its OAuth metadata to request newly added scopes, because refresh tokens cannot widen an existing grant.
 
 Configure one high-entropy encryption secret and keep it out of Git:
 
@@ -118,14 +120,14 @@ Validate the bundle without publishing:
 npm run type-check
 npm run lint
 npm test
-npx wrangler deploy --dry-run
+npm run deploy:dry
 ```
 
 For a terminal deployment, set the one required Worker secret and deploy. Wrangler creates the KV namespaces because their IDs are omitted from `wrangler.jsonc`:
 
 ```sh
 npx wrangler secret put MAIL_CREDENTIALS_ENCRYPTION_KEY
-npx wrangler deploy
+npm run deploy
 ```
 
 The OAuth provider publishes the standard authorization-server and protected-resource discovery documents. In ChatGPT web, add the deployed `/mcp` URL and select **OAuth**; the browser will show the Worker’s login page. Do not select **No Authentication**, because every resource tool is private. Refresh tokens are generated and rotated by the OAuth provider; they are not handled by the mail code.
@@ -180,7 +182,7 @@ The tests include transcript-backed fake sockets and cover:
 - signed stateless DAV cursor validation and query mismatch rejection;
 - multi-account selection, default-account routing, account summaries, custom IMAP/SMTP endpoint validation, reconnect-only account management, legacy-record migration, and absence of cross-account fanout;
 - stateless MCP initialization/tool listing without `Mcp-Session-Id`;
-- OAuth PKCE, signed one-time state cookies, bounded authorization forms, conditional service verification, credential verification failures and retry limits, encrypted credential storage, per-token scope narrowing, and requested read/offline scopes.
+- OAuth PKCE, signed one-time state cookies, bounded authorization forms, automatic granting of all client-requested supported scopes, conditional service verification, credential verification failures and retry limits, encrypted credential storage, and per-token scope narrowing.
 
 Live iCloud testing should begin with read-only mailbox listing/search/message fetches. Before enabling general recipients, test `send_email` only to the owner address.
 

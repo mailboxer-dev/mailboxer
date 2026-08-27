@@ -2,6 +2,7 @@ import type { AuthRequest, CompleteAuthorizationOptions, OAuthHelpers } from "@c
 import { describe, expect, it, vi } from "vitest";
 import { commitAccountDraft, newAccountDraft } from "../src/accounts";
 import { createCredentialAuthHandler, type CredentialAuthDependencies } from "../src/auth";
+import { decodeAuthPageModel, type AuthPageModel } from "../src/auth-ui";
 import { MailCredentialError } from "../src/credentials";
 import { restrictMailPropsToTokenScope, type AppEnv, type StoredMailAccount } from "../src/types";
 
@@ -27,7 +28,7 @@ function oauthRequest(): AuthRequest {
   return {
     responseType: "code",
     clientId: "client-1",
-    redirectUri: "https://client.example/callback",
+    redirectUri: "http://127.0.0.1:6274/oauth/callback?tenant=one",
     scope: ["mail.read", "mail.write", "offline_access"],
     state: "client-state",
     codeChallenge: "client-challenge",
@@ -73,7 +74,7 @@ function oauthEnv(options: {
       tokenEndpointAuthMethod: "none",
       clientName: "Test <client>",
     }),
-    completeAuthorization: options.complete ?? (async () => ({ redirectTo: "https://client.example/callback?code=local" })),
+    completeAuthorization: options.complete ?? (async () => ({ redirectTo: "http://127.0.0.1:6274/oauth/callback?code=local" })),
   } as unknown as OAuthHelpers;
   return {
     OAUTH_KV: (options.oauthKv ?? new MemoryKv()) as unknown as KVNamespace,
@@ -102,10 +103,19 @@ function stateAndCookie(response: Response): { state: string; cookie: string } {
   return { state, cookie };
 }
 
-function post(state: string, cookie: string | undefined, values: Record<string, string>, scopes = ["mail.read"]): Request {
+async function pageModel(response: Response): Promise<AuthPageModel> {
+  const body = await response.text();
+  const encoded = /data-page="([A-Za-z0-9_-]+)"/u.exec(body)?.[1];
+  expect(encoded).toBeTruthy();
+  return decodeAuthPageModel(encoded ?? "");
+}
+
+function post(state: string, cookie: string | undefined, values: Record<string, string>, scopes: string[] = []): Request {
   const body = new URLSearchParams({ authorization_state: state, ...values });
-  if (!body.has("scope_form")) body.set("scope_form", "1");
-  for (const scope of scopes) body.append("scope", scope);
+  if (scopes.length) {
+    body.set("scope_form", "1");
+    for (const scope of scopes) body.append("scope", scope);
+  }
   return new Request("https://mcp.example/authorize", {
     method: "POST",
     headers: {
@@ -116,11 +126,10 @@ function post(state: string, cookie: string | undefined, values: Record<string, 
   });
 }
 
-function initialAccountForm(state: string, cookie: string | undefined, mode: "create" | "manage" = "create"): Request {
+function initialAccountForm(state: string, cookie: string | undefined): Request {
   return post(state, cookie, {
     action: "verify",
     target: "start",
-    mode,
     preset: "icloud",
     label: "Personal",
     address: "primary@icloud.com",
@@ -144,17 +153,28 @@ describe("multi-account OAuth authorization", () => {
     )).toEqual({ userId: "icloud-test", credentialId: "icloud-test", scopes: ["mail.read"] });
   });
 
-  it("renders a generic create/manage page with requested scopes and no credentials", async () => {
+  it("renders the React authorization shell without permissions or credentials", async () => {
     const oauthKv = new MemoryKv();
     const response = await authFetchFor()(new Request("https://mcp.example/authorize"), oauthEnv({ oauthKv }), context);
     const body = await response.text();
     expect(response.status).toBe(200);
-    expect(body).toContain("Email MCP");
-    expect(body).toContain("Create a new profile");
-    expect(body).toContain("Manage an existing profile");
-    expect(body).toContain("mail.read");
-    expect(body).not.toContain("calendar.read");
+    expect(body).toContain("/auth.js");
+    expect(body).toContain("/style.css");
+    expect(body).not.toContain("mail.read");
+    expect(body).not.toContain("Permissions");
     expect(body).not.toContain("app-password");
+    const encoded = /data-page="([A-Za-z0-9_-]+)"/u.exec(body)?.[1] ?? "";
+    const model = decodeAuthPageModel(encoded);
+    expect(model.kind).toBe("account-form");
+    if (model.kind === "account-form") {
+      expect(model.account.preset).toBe("icloud");
+      expect(model.account.address).toBe("");
+    }
+    expect(response.headers.get("Content-Security-Policy")).toContain("script-src 'self'");
+    const initialCsp = response.headers.get("Content-Security-Policy") ?? "";
+    expect(initialCsp).toContain("form-action 'self' http://127.0.0.1:6274");
+    expect(initialCsp).not.toContain("/callback");
+    expect(initialCsp).not.toContain("tenant=one");
     expect(response.headers.get("Set-Cookie")).toContain("HttpOnly");
     expect(response.headers.get("Set-Cookie")).toContain("Path=/authorize");
     expect(oauthKv.values.size).toBe(1);
@@ -182,7 +202,7 @@ describe("multi-account OAuth authorization", () => {
   it("creates an encrypted draft, commits it on Continue, and issues opaque v2 props", async () => {
     const oauthKv = new MemoryKv();
     const credentialsKv = new MemoryKv();
-    const complete = vi.fn(async (_options: CompleteAuthorizationOptions) => ({ redirectTo: "https://client.example/callback?code=issued" }));
+    const complete = vi.fn(async (_options: CompleteAuthorizationOptions) => ({ redirectTo: "http://127.0.0.1:6274/oauth/callback?code=issued" }));
     const environment = oauthEnv({ oauthKv, credentialsKv, complete });
     const authFetch = authFetchFor({ verifyAccountSubmission: vi.fn(async () => account()) });
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
@@ -190,18 +210,24 @@ describe("multi-account OAuth authorization", () => {
 
     const verified = await authFetch(initialAccountForm(state, cookie), environment, context);
     expect(verified.status).toBe(200);
-    expect(await verified.text()).toContain("Review the profile");
+    const managementCsp = verified.headers.get("Content-Security-Policy") ?? "";
+    expect(managementCsp).toContain("form-action 'self' http://127.0.0.1:6274");
+    expect(managementCsp).not.toContain("/callback");
+    expect(managementCsp).not.toContain("tenant=one");
+    const verifiedPage = await pageModel(verified);
+    expect(verifiedPage.kind).toBe("management");
+    expect(verifiedPage.message?.text).toContain("New profile ready");
     expect([...credentialsKv.values.values()].join("\n")).not.toContain("app-password");
 
-    const response = await authFetch(post(state, cookie, { action: "continue", mode: "manage" }, ["mail.read", "offline_access"]), environment, context);
+    const response = await authFetch(post(state, cookie, { action: "continue" }, ["mail.read", "offline_access"]), environment, context);
     expect(response.status).toBe(302);
     expect(response.headers.get("Location")).toContain("code=issued");
     expect(response.headers.get("Set-Cookie")).toContain("Max-Age=0");
     expect(complete).toHaveBeenCalledOnce();
     const options = complete.mock.calls[0][0];
     expect(options.userId).toMatch(/^usr_/u);
-    expect(options.scope).toEqual(["mail.read", "offline_access"]);
-    expect(options.props).toEqual({ userId: options.userId, scopes: ["mail.read"] });
+    expect(options.scope).toEqual(["mail.read", "mail.write", "offline_access"]);
+    expect(options.props).toEqual({ userId: options.userId, scopes: ["mail.read", "mail.write"] });
     expect(JSON.stringify(options.props)).not.toContain("icloud.com");
     expect(oauthKv.values.size).toBe(0);
   });
@@ -215,12 +241,14 @@ describe("multi-account OAuth authorization", () => {
     const authFetch = authFetchFor({ verifyAccountSubmission: vi.fn(async () => verifiedAccount) });
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
-    const response = await authFetch(initialAccountForm(state, cookie, "manage"), environment, context);
-    const body = await response.text();
+    const response = await authFetch(initialAccountForm(state, cookie), environment, context);
+    const model = await pageModel(response);
     expect(response.status).toBe(200);
-    expect(body).toContain("Personal");
-    expect(body).toContain("Manage Email MCP accounts");
-    expect(body).not.toContain(vault.userId);
+    expect(model.kind).toBe("management");
+    if (model.kind === "management") expect(model.accounts[0]?.label).toBe("Personal");
+    expect(model.message?.text).toContain("Existing profile found");
+    expect(model.title).toBe("Manage Email MCP accounts");
+    expect(JSON.stringify(model)).not.toContain(vault.userId);
   });
 
   it("returns a generic verification error and enforces the five-attempt limit", async () => {
@@ -233,7 +261,7 @@ describe("multi-account OAuth authorization", () => {
     for (let attempt = 1; attempt <= 4; attempt += 1) {
       const response = await authFetch(initialAccountForm(state, cookie), environment, context);
       expect(response.status).toBe(401);
-      expect(await response.text()).toContain("could not be verified");
+      expect((await pageModel(response)).message?.text).toContain("could not be verified");
     }
     const final = await authFetch(initialAccountForm(state, cookie), environment, context);
     expect(final.status).toBe(401);
@@ -249,7 +277,7 @@ describe("multi-account OAuth authorization", () => {
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
     await authFetch(initialAccountForm(state, cookie), environment, context);
-    const denied = await authFetch(post(state, cookie, { decision: "deny", mode: "manage" }, []), environment, context);
+    const denied = await authFetch(post(state, cookie, { decision: "deny" }, []), environment, context);
     expect(denied.status).toBe(302);
     expect(denied.headers.get("Location")).toContain("error=access_denied");
     expect(oauthKv.values.size).toBe(0);

@@ -8,23 +8,27 @@ import {
   addDraftAccount,
   commitAccountDraft,
   deleteAccountDraft,
+  findAccountDraft,
   loadAccountDraft,
   newAccountDraft,
   removeDraftAccount,
   replaceDraftAccount,
   saveAccountDraft,
   setDraftDefault,
-  unlockAccountDraft,
   verifyAccountSubmission,
   type AccountDraft,
   type AccountSubmission,
 } from "./accounts";
+import {
+  renderAuthPage,
+  type AccountFormModel,
+  type AccountFormTarget,
+} from "./auth-ui";
 import { getCredentialsEncryptionSecret } from "./config";
 import { MailCredentialError } from "./credentials";
 import { logFailure } from "./diagnostics";
 import {
   RESOURCE_SCOPES,
-  type AccountCapabilities,
   type OAuthEnv,
   type StoredMailAccount,
 } from "./types";
@@ -36,16 +40,11 @@ const STATE_KEY_PREFIX = "mail-oauth:state:";
 const STATE_COOKIE_NAME = "mcp_oauth_state";
 const AUTH_SCOPES = [...RESOURCE_SCOPES, "offline_access"] as const;
 const STATE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/u;
-
-type WizardMode = "create" | "manage";
-type AccountFormTarget = "start" | "add" | "edit";
-
 interface StoredAuthState {
   request: AuthRequest;
   clientName: string;
   attempts: number;
   grantedScopes?: string[];
-  mode?: WizardMode;
 }
 
 export interface CredentialAuthDependencies {
@@ -69,7 +68,6 @@ const storedStateSchema = z.object({
   clientName: z.string().max(256),
   attempts: z.number().int().min(0).max(MAX_AUTH_ATTEMPTS),
   grantedScopes: z.array(z.string()).max(AUTH_SCOPES.length).optional(),
-  mode: z.enum(["create", "manage"]).optional(),
 });
 
 function base64UrlEncode(bytes: Uint8Array): string {
@@ -178,6 +176,13 @@ function redirectWithCookie(url: string, cookie: string): Response {
   return new Response(null, { status: redirect.status, headers });
 }
 
+function formActionSource(redirectUri: string): string {
+  const redirect = new URL(redirectUri);
+  // CSP cannot represent an opaque custom-scheme origin; the scheme is the
+  // narrowest source expression available for those registered callbacks.
+  return redirect.origin === "null" ? redirect.protocol : redirect.origin;
+}
+
 function errorRedirect(request: AuthRequest, code: string, description: string): Response {
   const redirect = new URL(request.redirectUri);
   redirect.searchParams.set("error", code);
@@ -194,27 +199,16 @@ function jsonError(message: string, status: number): Response {
   return Response.json({ error: message }, { status, headers: { "Cache-Control": "no-store" } });
 }
 
-function htmlResponse(body: string, status = 200, cookie?: string): Response {
+function htmlResponse(body: string, formAction: string, status = 200, cookie?: string): Response {
   const headers = new Headers({
     "Cache-Control": "no-store",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    "Content-Security-Policy": `default-src 'none'; script-src 'self'; style-src 'self'; form-action 'self' ${formAction}; base-uri 'none'; frame-ancestors 'none'`,
     "Content-Type": "text/html; charset=utf-8",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
   });
   if (cookie) headers.set("Set-Cookie", cookie);
   return new Response(body, { status, headers });
-}
-
-function escapeHtml(value: string): string {
-  const entities: Record<string, string> = {
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  };
-  return value.replace(/[&<>"']/gu, (character) => entities[character]);
 }
 
 function asStoredState(value: unknown): StoredAuthState | null {
@@ -228,33 +222,6 @@ function requestedScopes(request: AuthRequest): Array<(typeof AUTH_SCOPES)[numbe
 
 function resourceScopes(scopes: readonly string[]): string[] {
   return scopes.filter((scope) => (RESOURCE_SCOPES as readonly string[]).includes(scope));
-}
-
-function scopeLabel(scope: (typeof AUTH_SCOPES)[number]): string {
-  if (scope === "mail.read") return "Read and search mail, messages, and attachments";
-  if (scope === "mail.write") return "Change flags, move/delete messages, and send mail";
-  if (scope === "calendar.read") return "Read calendars, events, and reminders";
-  if (scope === "calendar.write") return "Create, update, and delete calendar events and reminders";
-  if (scope === "contacts.read") return "Read contacts and address books";
-  if (scope === "contacts.write") return "Create, update, and delete contacts";
-  return "Keep the connection active with refresh tokens";
-}
-
-function scopeConsent(request: AuthRequest, selected: readonly string[]): string {
-  const requested = requestedScopes(request);
-  const selectedSet = new Set(selected);
-  const inputs = requested.map((scope) => `
-        <label class="scope">
-          <input type="checkbox" name="scope" value="${escapeHtml(scope)}"${selectedSet.has(scope) ? " checked" : ""}>
-          <span><strong>${escapeHtml(scope)}</strong><br>${escapeHtml(scopeLabel(scope))}</span>
-        </label>`).join("");
-  return `
-      <fieldset>
-        <legend>Permissions</legend>
-        <p class="hint">Choose the permissions to grant to this Email MCP connection. Only permissions requested by the MCP client are shown.</p>
-        <input type="hidden" name="scope_form" value="1">
-        ${inputs}
-      </fieldset>`;
 }
 
 interface AccountFormValues {
@@ -284,7 +251,11 @@ function firstValue(form: URLSearchParams | undefined, names: readonly string[])
   return "";
 }
 
-function accountFormValues(form?: URLSearchParams, existing?: StoredMailAccount): AccountFormValues {
+function accountFormValues(
+  form?: URLSearchParams,
+  existing?: StoredMailAccount,
+  defaults = { mail: true, calendar: false, contacts: false },
+): AccountFormValues {
   const config = existing?.config;
   const serviceOptionsPresent = form?.get("service_options_present") === "1";
   const customFieldsPresent = form?.get("custom_fields_present") === "1";
@@ -294,9 +265,9 @@ function accountFormValues(form?: URLSearchParams, existing?: StoredMailAccount)
     preset,
     label: firstValue(form, ["label", "account_label"]) || existing?.label || "",
     address: firstValue(form, ["address", "email", "icloud_email"]) || existing?.address || "",
-    enableMail: serviceOptionsPresent ? Boolean(form?.get("enable_mail")) : existing?.capabilities.mail ?? true,
-    enableCalendar: serviceOptionsPresent ? Boolean(form?.get("enable_calendar")) : existing?.capabilities.calendar ?? false,
-    enableContacts: serviceOptionsPresent ? Boolean(form?.get("enable_contacts")) : existing?.capabilities.contacts ?? false,
+    enableMail: serviceOptionsPresent ? Boolean(form?.get("enable_mail")) : existing?.capabilities.mail ?? defaults.mail,
+    enableCalendar: serviceOptionsPresent ? Boolean(form?.get("enable_calendar")) : existing?.capabilities.calendar ?? defaults.calendar,
+    enableContacts: serviceOptionsPresent ? Boolean(form?.get("enable_contacts")) : existing?.capabilities.contacts ?? defaults.contacts,
     imapHost: firstValue(form, ["imap_host"]) || config?.imapHost || "",
     imapPort: firstValue(form, ["imap_port"]) || (config?.imapPort ? String(config.imapPort) : "993"),
     imapTlsMode: firstValue(form, ["imap_tls_mode"]) === "starttls" || config?.imapTlsMode === "starttls" ? "starttls" : "implicit",
@@ -311,201 +282,106 @@ function accountFormValues(form?: URLSearchParams, existing?: StoredMailAccount)
   };
 }
 
-function accountFields(form?: URLSearchParams, existing?: StoredMailAccount): string {
-  const values = accountFormValues(form, existing);
-  const checked = (value: boolean): string => value ? " checked" : "";
-  const selected = (value: string, expected: string): string => value === expected ? " selected" : "";
-  return `
-        <label for="label">Account name</label>
-        <input id="label" name="label" type="text" maxlength="80" value="${escapeHtml(values.label)}" required>
-        <label for="address">Email address</label>
-        <input id="address" name="address" type="email" autocomplete="username" maxlength="320" value="${escapeHtml(values.address)}" required>
-        <label for="preset">Provider</label>
-        <select id="preset" name="preset">
-          <option value="icloud"${selected(values.preset, "icloud")}>iCloud preset</option>
-          <option value="custom"${selected(values.preset, "custom")}>Custom IMAP/SMTP</option>
-        </select>
-
-        <fieldset>
-          <legend>Services</legend>
-          <input type="hidden" name="service_options_present" value="1">
-          <label class="check"><input type="checkbox" name="enable_mail" value="1"${checked(values.enableMail)}> Mail</label>
-          <label class="check"><input type="checkbox" name="enable_calendar" value="1"${checked(values.enableCalendar)}${values.preset === "custom" ? " disabled" : ""}> Calendar and reminders</label>
-          <label class="check"><input type="checkbox" name="enable_contacts" value="1"${checked(values.enableContacts)}${values.preset === "custom" ? " disabled" : ""}> Contacts</label>
-        </fieldset>
-
-        <section class="provider-fields">
-          <h2>iCloud preset</h2>
-          <p class="hint">Uses iCloud IMAP, SMTP, CalDAV, and CardDAV endpoints. Use an Apple app-specific password.</p>
-          <label for="app_password">Apple app-specific password</label>
-          <input id="app_password" name="app_password" type="password" autocomplete="current-password" maxlength="256">
-        </section>
-
-        <section class="provider-fields">
-          <h2>Custom IMAP/SMTP</h2>
-          <input type="hidden" name="custom_fields_present" value="1">
-          <label for="imap_host">IMAP hostname</label>
-          <input id="imap_host" name="imap_host" type="text" maxlength="253" value="${escapeHtml(values.imapHost)}">
-          <label for="imap_port">IMAP port</label>
-          <input id="imap_port" name="imap_port" type="number" min="1" max="65535" value="${escapeHtml(values.imapPort)}">
-          <label for="imap_tls_mode">IMAP TLS</label>
-          <select id="imap_tls_mode" name="imap_tls_mode">
-            <option value="implicit"${selected(values.imapTlsMode, "implicit")}>Implicit TLS (993)</option>
-            <option value="starttls"${selected(values.imapTlsMode, "starttls")}>STARTTLS (143)</option>
-          </select>
-          <label for="imap_user">IMAP username</label>
-          <input id="imap_user" name="imap_user" type="text" maxlength="320" value="${escapeHtml(values.imapUser)}">
-          <label for="imap_password">IMAP password</label>
-          <input id="imap_password" name="imap_password" type="password" autocomplete="current-password" maxlength="256">
-          <label for="smtp_host">SMTP hostname</label>
-          <input id="smtp_host" name="smtp_host" type="text" maxlength="253" value="${escapeHtml(values.smtpHost)}">
-          <label for="smtp_port">SMTP port</label>
-          <input id="smtp_port" name="smtp_port" type="number" min="1" max="65535" value="${escapeHtml(values.smtpPort)}">
-          <label for="smtp_tls_mode">SMTP TLS</label>
-          <select id="smtp_tls_mode" name="smtp_tls_mode">
-            <option value="implicit"${selected(values.smtpTlsMode, "implicit")}>Implicit TLS (465)</option>
-            <option value="starttls"${selected(values.smtpTlsMode, "starttls")}>STARTTLS (587 or 2525)</option>
-          </select>
-          <label for="smtp_user">SMTP username</label>
-          <input id="smtp_user" name="smtp_user" type="text" maxlength="320" value="${escapeHtml(values.smtpUser)}">
-          <label for="smtp_password">SMTP password</label>
-          <input id="smtp_password" name="smtp_password" type="password" autocomplete="current-password" maxlength="256">
-          <label class="check"><input type="checkbox" name="same_smtp_credentials" value="1"${checked(values.sameSmtpCredentials)}> Use the IMAP username and password for SMTP</label>
-        </section>`;
-}
-
-function renderPageShell(title: string, clientName: string, content: string, errorMessage?: string): string {
-  const error = errorMessage ? `<p class="error" role="alert">${escapeHtml(errorMessage)}</p>` : "";
-  return `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>${escapeHtml(title)}</title>
-    <style>
-      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f6f8; color: #172033; }
-      main { width: min(48rem, calc(100% - 2rem)); box-sizing: border-box; padding: 2rem; border: 1px solid #d9dde7; border-radius: 1rem; background: white; box-shadow: 0 1rem 3rem #17203318; }
-      h1 { margin-top: 0; font-size: 1.5rem; } h2 { font-size: 1.05rem; margin-bottom: .5rem; }
-      p { line-height: 1.5; } label { display: block; margin-top: 1rem; font-weight: 600; }
-      fieldset { margin: 1.25rem 0; padding: .85rem; border: 1px solid #d9dde7; border-radius: .6rem; }
-      legend { padding: 0 .35rem; font-weight: 700; } .scope { display: flex; gap: .75rem; align-items: flex-start; padding: .7rem; margin: .45rem 0; border: 1px solid #d9dde7; border-radius: .6rem; }
-      .scope input, .check input { margin-top: .25rem; } .check { font-weight: 400; }
-      input[type="email"], input[type="password"], input[type="text"], input[type="number"], select { box-sizing: border-box; width: 100%; margin-top: .4rem; padding: .65rem; border: 1px solid #aeb5c5; border-radius: .5rem; font: inherit; }
-      .hint { color: #526078; font-size: .92rem; } .error { padding: .75rem; border-radius: .5rem; background: #fee2e2; color: #991b1b; }
-      .provider-fields { border-top: 1px solid #e2e6ee; margin-top: 1.25rem; padding-top: .5rem; }
-      .account { padding: .85rem; margin: .6rem 0; border: 1px solid #d9dde7; border-radius: .6rem; }
-      .account strong { display: block; } .account-actions, .actions { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: .75rem; }
-      button { padding: .65rem 1rem; border: 0; border-radius: .5rem; font: inherit; cursor: pointer; } button.primary { background: #2563eb; color: white; }
-      button.secondary { background: #e7eaf0; color: #172033; } button.danger { background: #b91c1c; color: white; }
-      @media (prefers-color-scheme: dark) { body { background: #111827; color: #eef2ff; } main { background: #1f2937; border-color: #4b5563; } fieldset, .scope, .account { border-color: #4b5563; } input, select { background: #111827; color: #eef2ff; border-color: #6b7280; } .error { background: #451a1a; color: #fecaca; } .hint { color: #c0c9da; } button.secondary { background: #374151; color: #eef2ff; } }
-    </style>
-  </head>
-  <body><main><h1>${escapeHtml(title)}</h1><p><strong>${escapeHtml(clientName || "MCP client")}</strong> is requesting access to this Email MCP.</p>${error}${content}</main></body>
-</html>`;
-}
-
-function hiddenState(state: string, mode?: WizardMode, target?: AccountFormTarget, accountId?: string): string {
-  return `<input type="hidden" name="authorization_state" value="${escapeHtml(state)}">${mode ? `<input type="hidden" name="mode" value="${mode}">` : ""}${target ? `<input type="hidden" name="target" value="${target}">` : ""}${accountId ? `<input type="hidden" name="account_id" value="${escapeHtml(accountId)}">` : ""}`;
+function accountFormModel(
+  form?: URLSearchParams,
+  existing?: StoredMailAccount,
+  defaults?: { mail: boolean; calendar: boolean; contacts: boolean },
+): AccountFormModel {
+  const values = accountFormValues(form, existing, defaults);
+  return {
+    preset: values.preset,
+    label: values.label,
+    address: values.address,
+    services: {
+      mail: values.enableMail,
+      calendar: values.enableCalendar,
+      contacts: values.enableContacts,
+    },
+    imap: {
+      host: values.imapHost,
+      port: values.imapPort,
+      tlsMode: values.imapTlsMode,
+      user: values.imapUser,
+    },
+    smtp: {
+      host: values.smtpHost,
+      port: values.smtpPort,
+      tlsMode: values.smtpTlsMode,
+      user: values.smtpUser,
+      sameCredentials: values.sameSmtpCredentials,
+    },
+  };
 }
 
 function renderStartPage(
   state: string,
   stored: StoredAuthState,
-  selectedScopes: readonly string[],
   errorMessage?: string,
   form?: URLSearchParams,
 ): string {
-  const mode = firstValue(form, ["mode", "profile_mode"]) === "manage" ? "manage" : "create";
-  const content = `<form method="post" action="/authorize">
-        ${hiddenState(state, undefined, "start")}
-        ${scopeConsent(stored.request, selectedScopes)}
-        <label for="mode">Profile action</label>
-        <select id="mode" name="mode">
-          <option value="create"${mode === "create" ? " selected" : ""}>Create a new profile</option>
-          <option value="manage"${mode === "manage" ? " selected" : ""}>Manage an existing profile</option>
-        </select>
-        <p class="hint">Create starts a new profile with the verified account. Manage unlocks an existing profile by verifying any one of its live accounts.</p>
-        ${accountFields(form)}
-        <div class="actions">
-          <button class="secondary" type="submit" name="decision" value="deny">Cancel</button>
-          <button class="primary" type="submit" name="action" value="verify">${mode === "manage" ? "Unlock profile" : "Verify and continue"}</button>
-        </div>
-      </form>`;
-  return renderPageShell("Email MCP", stored.clientName, content, errorMessage);
+  const scopes = requestedScopes(stored.request);
+  return renderAuthPage({
+    version: 1,
+    kind: "account-form",
+    title: "Connect Email MCP",
+    clientName: stored.clientName,
+    state,
+    target: "start",
+    account: accountFormModel(form, undefined, {
+      mail: scopes.some((scope) => scope.startsWith("mail.")),
+      calendar: scopes.some((scope) => scope.startsWith("calendar.")),
+      contacts: scopes.some((scope) => scope.startsWith("contacts.")),
+    }),
+    draftNotice: false,
+    ...(errorMessage ? { message: { kind: "error" as const, text: errorMessage } } : {}),
+  });
 }
 
 function renderAccountFormPage(
   state: string,
   stored: StoredAuthState,
-  draft: AccountDraft,
   target: "add" | "edit",
-  selectedScopes: readonly string[],
   errorMessage?: string,
   form?: URLSearchParams,
   existing?: StoredMailAccount,
 ): string {
   const heading = target === "add" ? "Add an account" : "Edit an account";
-  const content = `<form method="post" action="/authorize">
-        ${hiddenState(state, "manage", target, existing?.accountId)}
-        ${scopeConsent(stored.request, selectedScopes)}
-        <p class="hint">Account changes are held in this encrypted reconnect draft until you choose Continue.</p>
-        ${accountFields(form, existing)}
-        <div class="actions">
-          <button class="secondary" type="submit" name="action" value="list">Back to accounts</button>
-          <button class="primary" type="submit" name="action" value="verify">Verify and save draft</button>
-        </div>
-      </form>`;
-  return renderPageShell(heading, stored.clientName, content, errorMessage);
-}
-
-function capabilityText(capabilities: AccountCapabilities, selectedScopes: readonly string[]): string {
-  const hasScope = (prefix: "mail" | "calendar" | "contacts"): boolean => selectedScopes.some((scope) => scope.startsWith(`${prefix}.`));
-  const label = (name: string, prefix: "mail" | "calendar" | "contacts"): string => (
-    hasScope(prefix) ? name : `${name} (unavailable until the MCP client requests its OAuth scope)`
-  );
-  return [
-    capabilities.mail ? label("Mail", "mail") : "",
-    capabilities.calendar ? label("Calendar", "calendar") : "",
-    capabilities.contacts ? label("Contacts", "contacts") : "",
-  ].filter(Boolean).join(", ");
+  return renderAuthPage({
+    version: 1,
+    kind: "account-form",
+    title: heading,
+    clientName: stored.clientName,
+    state,
+    target,
+    ...(existing ? { accountId: existing.accountId } : {}),
+    account: accountFormModel(form, existing),
+    draftNotice: true,
+    ...(errorMessage ? { message: { kind: "error" as const, text: errorMessage } } : {}),
+  });
 }
 
 function renderManagementPage(
   state: string,
   stored: StoredAuthState,
   draft: AccountDraft,
-  selectedScopes: readonly string[],
   message?: string,
 ): string {
-  const accountList = draft.accounts.map((account) => `<article class="account">
-          <strong>${escapeHtml(account.label)}${account.accountId === draft.defaultAccountId ? " (default)" : ""}</strong>
-          <span>${escapeHtml(account.address)}</span><br>
-          <span class="hint">${escapeHtml(account.preset === "icloud" ? "iCloud preset" : "Custom IMAP/SMTP")} · ${escapeHtml(capabilityText(account.capabilities, selectedScopes) || "No services")}</span>
-          <form class="account-actions" method="post" action="/authorize">
-            ${hiddenState(state, "manage")}
-            <input type="hidden" name="account_id" value="${escapeHtml(account.accountId)}">
-            ${selectedScopes.map((scope) => `<input type="hidden" name="scope" value="${escapeHtml(scope)}">`).join("")}
-            <input type="hidden" name="scope_form" value="1">
-            <button class="secondary" type="submit" name="action" value="test">Test</button>
-            <button class="secondary" type="submit" name="action" value="edit">Edit</button>
-            ${account.accountId === draft.defaultAccountId ? "" : `<button class="secondary" type="submit" name="action" value="set_default">Make default</button>`}
-            <button class="danger" type="submit" name="action" value="remove">Remove</button>
-          </form>
-        </article>`).join("");
-  const content = `${message ? `<p class="hint" role="status">${escapeHtml(message)}</p>` : ""}
-        <p>Manage the accounts attached to this Email MCP profile. The verified account details are stored encrypted; mailbox, calendar, and contact content is never stored here.</p>
-        ${accountList}
-        <form method="post" action="/authorize">
-        ${hiddenState(state, "manage")}
-        ${scopeConsent(stored.request, selectedScopes)}
-        <div class="actions">
-          <button class="secondary" type="submit" name="action" value="add">Add account</button>
-          <button class="primary" type="submit" name="action" value="continue">Continue</button>
-          <button class="secondary" type="submit" name="decision" value="deny">Cancel</button>
-        </div>
-      </form>`;
-  return renderPageShell("Manage Email MCP accounts", stored.clientName, content);
+  return renderAuthPage({
+    version: 1,
+    kind: "management",
+    title: "Manage Email MCP accounts",
+    clientName: stored.clientName,
+    state,
+    accounts: draft.accounts.map((account) => ({
+      accountId: account.accountId,
+      label: account.label,
+      address: account.address,
+      preset: account.preset,
+      capabilities: account.capabilities,
+      isDefault: account.accountId === draft.defaultAccountId,
+    })),
+    ...(message ? { message: { kind: "status" as const, text: message } } : {}),
+  });
 }
 
 async function readBoundedBody(request: Request): Promise<Uint8Array> {
@@ -630,12 +506,8 @@ function accountSubmissionFromStored(account: StoredMailAccount): AccountSubmiss
   };
 }
 
-function selectedScopesForForm(form: URLSearchParams, stored: StoredAuthState): string[] {
-  const requested = requestedScopes(stored.request);
-  const values = form.get("scope_form") === "1"
-    ? form.getAll("scope")
-    : stored.grantedScopes ?? requested;
-  return requested.filter((scope) => values.includes(scope));
+function automaticallyGrantedScopes(stored: StoredAuthState): string[] {
+  return requestedScopes(stored.request);
 }
 
 function stateCookieFor(request: Request, state: string, secret: string): Promise<string> {
@@ -646,8 +518,7 @@ function isVerificationError(error: unknown): boolean {
   return error instanceof MailCredentialError || error instanceof AccountVaultError || error instanceof z.ZodError;
 }
 
-function verificationFailureMessage(mode: WizardMode, target: AccountFormTarget): string {
-  if (mode === "manage" && target === "start") return "The account profile could not be unlocked. Check the account details and try again.";
+function verificationFailureMessage(): string {
   return "The account could not be verified. Check the account details and try again.";
 }
 
@@ -691,7 +562,12 @@ async function beginCredentialAuthorization(request: Request, env: OAuthEnv): Pr
     attempts: 0,
   };
   await persistAuthState(env, state, stored);
-  return htmlResponse(renderStartPage(state, stored, requestedScopes(oauthRequest)), 200, await stateCookieFor(request, state, secret));
+  return htmlResponse(
+    renderStartPage(state, stored),
+    formActionSource(oauthRequest.redirectUri),
+    200,
+    await stateCookieFor(request, state, secret),
+  );
 }
 
 async function completeAuthorization(
@@ -717,6 +593,7 @@ async function completeAuthorization(
     await deleteAccountDraft(env, stateToken);
     return jsonError("Expired authorization state", 400);
   }
+  const callbackFormAction = formActionSource(stored.request.redirectUri);
 
   if (form.get("decision") === "deny") {
     await deleteWizardState(env, stateToken);
@@ -727,30 +604,21 @@ async function completeAuthorization(
     );
   }
 
-  const selectedScopes = selectedScopesForForm(form, stored);
+  const selectedScopes = automaticallyGrantedScopes(stored);
   const grantedResourceScopes = resourceScopes(selectedScopes);
-  if (!grantedResourceScopes.length) {
-    return htmlResponse(
-      renderStartPage(stateToken, stored, selectedScopes, "Select at least one requested permission.", form),
-      400,
-      await stateCookieFor(request, stateToken, secret),
-    );
-  }
-
   const action = form.get("action") ?? "verify";
-  const mode = form.get("mode") === "manage" || stored.mode === "manage" ? "manage" : "create";
   const targetValue = form.get("target");
   const target: AccountFormTarget = targetValue === "add" || targetValue === "edit" ? targetValue : "start";
-  const stateWithSelection: StoredAuthState = { ...stored, grantedScopes: selectedScopes, mode };
+  const stateWithSelection: StoredAuthState = { ...stored, grantedScopes: selectedScopes };
 
   if (action === "add" || action === "edit") {
     const draft = await loadAccountDraft(env, stateToken);
     if (!draft) return jsonError("Expired authorization state", 400);
     const existing = action === "edit" ? draft.accounts.find((account) => account.accountId === (form.get("account_id") ?? "")) : undefined;
-    const nextState = { ...stateWithSelection, mode: "manage" as const };
-    await persistAuthState(env, stateToken, nextState);
+    await persistAuthState(env, stateToken, stateWithSelection);
     return htmlResponse(
-      renderAccountFormPage(stateToken, nextState, draft, action, selectedScopes, undefined, undefined, existing),
+      renderAccountFormPage(stateToken, stateWithSelection, action, undefined, undefined, existing),
+      callbackFormAction,
       200,
       await stateCookieFor(request, stateToken, secret),
     );
@@ -761,7 +629,8 @@ async function completeAuthorization(
     if (!draft) return jsonError("Expired authorization state", 400);
     await persistAuthState(env, stateToken, stateWithSelection);
     return htmlResponse(
-      renderManagementPage(stateToken, stateWithSelection, draft, selectedScopes),
+      renderManagementPage(stateToken, stateWithSelection, draft),
+      callbackFormAction,
       200,
       await stateCookieFor(request, stateToken, secret),
     );
@@ -778,7 +647,8 @@ async function completeAuthorization(
         await saveAccountDraft(env, stateToken, nextDraft);
         await persistAuthState(env, stateToken, stateWithSelection);
         return htmlResponse(
-          renderManagementPage(stateToken, stateWithSelection, nextDraft, selectedScopes, "The account was removed from this draft."),
+          renderManagementPage(stateToken, stateWithSelection, nextDraft, "The account was removed from this draft."),
+          callbackFormAction,
           200,
           await stateCookieFor(request, stateToken, secret),
         );
@@ -788,7 +658,8 @@ async function completeAuthorization(
         await saveAccountDraft(env, stateToken, nextDraft);
         await persistAuthState(env, stateToken, stateWithSelection);
         return htmlResponse(
-          renderManagementPage(stateToken, stateWithSelection, nextDraft, selectedScopes, "The default account was updated in this draft."),
+          renderManagementPage(stateToken, stateWithSelection, nextDraft, "The default account was updated in this draft."),
+          callbackFormAction,
           200,
           await stateCookieFor(request, stateToken, secret),
         );
@@ -809,14 +680,16 @@ async function completeAuthorization(
           const nextState = { ...stateWithSelection, attempts };
           await persistAuthState(env, stateToken, nextState);
           return htmlResponse(
-            renderManagementPage(stateToken, nextState, draft, selectedScopes, "The account could not be verified. Check its credentials and try again."),
+            renderManagementPage(stateToken, nextState, draft, "The account could not be verified. Check its credentials and try again."),
+            callbackFormAction,
             401,
             await stateCookieFor(request, stateToken, secret),
           );
         }
         await persistAuthState(env, stateToken, stateWithSelection);
         return htmlResponse(
-          renderManagementPage(stateToken, stateWithSelection, draft, selectedScopes, "The account connection was verified."),
+          renderManagementPage(stateToken, stateWithSelection, draft, "The account connection was verified."),
+          callbackFormAction,
           200,
           await stateCookieFor(request, stateToken, secret),
         );
@@ -837,7 +710,8 @@ async function completeAuthorization(
     } catch (error) {
       if (error instanceof AccountVaultError) {
         return htmlResponse(
-          renderManagementPage(stateToken, stateWithSelection, draft, selectedScopes, error.message),
+          renderManagementPage(stateToken, stateWithSelection, draft, error.message),
+          callbackFormAction,
           409,
           await stateCookieFor(request, stateToken, secret),
         );
@@ -867,24 +741,27 @@ async function completeAuthorization(
       if (!draft) return jsonError("Expired authorization state", 400);
       const existing = target === "edit" ? draft.accounts.find((account) => account.accountId === (form.get("account_id") ?? "")) : undefined;
       return htmlResponse(
-        renderAccountFormPage(stateToken, nextState, draft, target, selectedScopes, verificationFailureMessage(mode, target), form, existing),
+        renderAccountFormPage(stateToken, nextState, target, verificationFailureMessage(), form, existing),
+        callbackFormAction,
         401,
         await stateCookieFor(request, stateToken, secret),
       );
     }
     return htmlResponse(
-      renderStartPage(stateToken, nextState, selectedScopes, verificationFailureMessage(mode, target), form),
+      renderStartPage(stateToken, nextState, verificationFailureMessage(), form),
+      callbackFormAction,
       401,
       await stateCookieFor(request, stateToken, secret),
     );
   }
 
   let draft: AccountDraft;
+  let matchedExistingProfile = false;
   try {
-    if (target === "start" && mode === "manage") {
-      draft = await unlockAccountDraft(env, verifiedAccount);
-    } else if (target === "start") {
-      draft = newAccountDraft(verifiedAccount);
+    if (target === "start") {
+      const existingDraft = await findAccountDraft(env, verifiedAccount);
+      matchedExistingProfile = existingDraft !== null;
+      draft = existingDraft ?? newAccountDraft(verifiedAccount);
     } else {
       const existingDraft = await loadAccountDraft(env, stateToken);
       if (!existingDraft) return jsonError("Expired authorization state", 400);
@@ -901,11 +778,12 @@ async function completeAuthorization(
       response.headers.set("Set-Cookie", clearStateCookie(request, stateToken));
       return response;
     }
-    const nextState: StoredAuthState = { ...stateWithSelection, mode, attempts };
+    const nextState: StoredAuthState = { ...stateWithSelection, attempts };
     await persistAuthState(env, stateToken, nextState);
     if (target === "start") {
       return htmlResponse(
-        renderStartPage(stateToken, nextState, selectedScopes, "The account profile could not be unlocked. Check the account details and try again.", form),
+        renderStartPage(stateToken, nextState, "The account profile could not be unlocked. Check the account details and try again.", form),
+        callbackFormAction,
         401,
         await stateCookieFor(request, stateToken, secret),
       );
@@ -914,17 +792,23 @@ async function completeAuthorization(
     if (!existingDraft) return jsonError("Expired authorization state", 400);
     const existing = target === "edit" ? existingDraft.accounts.find((account) => account.accountId === (form.get("account_id") ?? "")) : undefined;
     return htmlResponse(
-      renderAccountFormPage(stateToken, nextState, existingDraft, target, selectedScopes, "The account could not be added to this profile.", form, existing),
+      renderAccountFormPage(stateToken, nextState, target, "The account could not be added to this profile.", form, existing),
+      callbackFormAction,
       409,
       await stateCookieFor(request, stateToken, secret),
     );
   }
 
   await saveAccountDraft(env, stateToken, draft);
-  const nextState: StoredAuthState = { ...stateWithSelection, mode: "manage" };
-  await persistAuthState(env, stateToken, nextState);
+  await persistAuthState(env, stateToken, stateWithSelection);
+  const resultMessage = target === "start"
+    ? matchedExistingProfile
+      ? "Existing profile found. Review its accounts, then Continue."
+      : "New profile ready. Review the account, then Continue."
+    : "The account changes were saved to this draft.";
   return htmlResponse(
-    renderManagementPage(stateToken, nextState, draft, selectedScopes, target === "start" ? "The account was verified. Review the profile, then Continue." : "The account changes were saved to this draft."),
+    renderManagementPage(stateToken, stateWithSelection, draft, resultMessage),
+    callbackFormAction,
     200,
     await stateCookieFor(request, stateToken, secret),
   );

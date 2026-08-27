@@ -9,13 +9,22 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["@types/node", "vitest/globals"]
+    "types": ["@types/node", "vitest/globals"],
+    "jsx": "react-jsx",
+    "baseUrl": ".",
+    "ignoreDeprecations": "6.0",
+    "paths": {
+      "@/*": ["ui/*"]
+    }
   },
   "include": [
     "worker-configuration.d.ts",
     "src/**/*.ts",
+    "ui/**/*.ts",
+    "ui/**/*.tsx",
     "tests/**/*.ts",
     "eslint.config.js",
-    "vitest.config.ts"
+    "vitest.config.ts",
+    "vite.config.ts"
   ]
 }

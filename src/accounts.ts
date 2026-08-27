@@ -432,7 +432,7 @@ export async function commitAccountDraft(env: AppEnv, draft: AccountDraft): Prom
   });
 }
 
-export async function unlockAccountDraft(env: AppEnv, verifiedAccount: StoredMailAccount): Promise<AccountDraft> {
+export async function findAccountDraft(env: AppEnv, verifiedAccount: StoredMailAccount): Promise<AccountDraft | null> {
   const secret = getCredentialsEncryptionSecret(env);
   const owner = await env.MAIL_CREDENTIALS_KV.get(await indexKey(verifiedAccount, secret));
   if (owner) {
@@ -459,7 +459,13 @@ export async function unlockAccountDraft(env: AppEnv, verifiedAccount: StoredMai
       if (!(error instanceof MailCredentialError)) throw error;
     }
   }
-  throw new AccountVaultError("The account profile could not be unlocked");
+  return null;
+}
+
+export async function unlockAccountDraft(env: AppEnv, verifiedAccount: StoredMailAccount): Promise<AccountDraft> {
+  const draft = await findAccountDraft(env, verifiedAccount);
+  if (!draft) throw new AccountVaultError("The account profile could not be unlocked");
+  return draft;
 }
 
 export function accountSummary(account: StoredMailAccount, defaultAccountId: string): AccountSummary {

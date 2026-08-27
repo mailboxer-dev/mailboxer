@@ -3,6 +3,7 @@ import {
   AccountVaultError,
   addDraftAccount,
   commitAccountDraft,
+  findAccountDraft,
   loadAccountDraft,
   loadAccountVault,
   newAccountDraft,
@@ -67,6 +68,10 @@ function account(seed: string, capabilities = { mail: true, calendar: false, con
 }
 
 describe("multi-account vault", () => {
+  it("returns no draft for a verified account that is not attached yet", async () => {
+    await expect(findAccountDraft(env(), account("new"))).resolves.toBeNull();
+  });
+
   it("encrypts drafts and vaults, routes by default or explicit account, and returns safe summaries", async () => {
     const kv = new MemoryKv();
     const environment = env(kv);
