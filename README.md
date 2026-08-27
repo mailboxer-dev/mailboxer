@@ -8,7 +8,7 @@ mailboxer connects your email, calendars, contacts, and reminders to any agent t
 
 Deploy mailboxer to your own Cloudflare account with the button below. Cloudflare provisions the Worker and its private storage; you only need to provide a unique encryption secret. Email credentials are added later through mailboxer’s sign-in page and are never committed to the repository.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/antoninguyot/mailboxer)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mailboxer-dev/mailboxer)
 
 ## Technical overview
 
