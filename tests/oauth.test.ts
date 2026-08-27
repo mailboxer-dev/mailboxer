@@ -189,6 +189,7 @@ describe("iCloud credential OAuth authorization", () => {
     const response = await authFetch(form, env, context());
     expect(response.status).toBe(302);
     expect(response.headers.get("Location")).toBe("https://client.example/callback?code=issued");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(response.headers.get("Set-Cookie")).toContain("Max-Age=0");
     expect(kv.keys()).toHaveLength(0);
     expect(complete).toHaveBeenCalledOnce();

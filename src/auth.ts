@@ -125,14 +125,11 @@ function clearStateCookie(request: Request): string {
 }
 
 function redirectWithCookie(url: string, cookie: string): Response {
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: url,
-      "Cache-Control": "no-store",
-      "Set-Cookie": cookie,
-    },
-  });
+  const redirect = Response.redirect(url, 302);
+  const headers = new Headers(redirect.headers);
+  headers.set("Cache-Control", "no-store");
+  headers.set("Set-Cookie", cookie);
+  return new Response(null, { status: redirect.status, headers });
 }
 
 function errorRedirect(request: AuthRequest, code: string, description: string): Response {
@@ -427,6 +424,15 @@ async function completeCredentialAuthorization(
     scope: grantedScopes,
     props,
   });
+  const redirect = new URL(result.redirectTo);
+  console.info(JSON.stringify({
+    event: "oauth.authorization_redirect_issued",
+    callbackHost: redirect.host,
+    callbackPath: redirect.pathname,
+    hasAuthorizationCode: redirect.searchParams.has("code"),
+    hasClientState: redirect.searchParams.has("state"),
+    hasIssuer: redirect.searchParams.has("iss"),
+  }));
   await env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${stateToken}`);
   return redirectWithCookie(result.redirectTo, clearStateCookie(request));
 }
