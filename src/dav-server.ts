@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { resolveAccount } from "./accounts";
 import { getCredentialsEncryptionSecret, getDavConfig } from "./config";
-import { getMailConfigForCredential } from "./credentials";
 import {
   MAX_DAV_PAGE_SIZE,
   MAX_DAV_RESOURCE_BYTES,
@@ -9,7 +9,7 @@ import {
 } from "./dav/client";
 import { cursorFingerprint, decodeDavCursor, encodeDavCursor } from "./dav/cursor";
 import { publicError, requireScope, textResult, withToolSpan } from "./mcp-helpers";
-import type { AppEnv, AuthProps } from "./types";
+import type { AccountCapability, AccountSummary, AppEnv, AuthProps } from "./types";
 import type { CalendarItemInput, ContactInput } from "./dav/types";
 import { isIsoDateOrDateTime, isUtcIsoDateOrDateTime } from "./dav/date";
 
@@ -101,10 +101,17 @@ const contactInputSchema = z.object({
 const listLimitSchema = z.number().int().min(1).max(MAX_DAV_PAGE_SIZE).optional().default(MAX_DAV_PAGE_SIZE);
 const utcIsoDateSchema = z.string().max(64).refine(isUtcIsoDateOrDateTime, "Invalid UTC ISO date or date-time");
 const deleteConfirmationSchema = z.literal("delete");
+const accountIdSchema = z.string().regex(/^acct_[A-Za-z0-9_-]{22}$|^icloud-[A-Za-z0-9_-]{43}$/u).optional();
 
-async function withUserDav<T>(env: AppEnv, props: AuthProps, operation: (client: DavClient) => Promise<T>): Promise<T> {
-  const config = await getMailConfigForCredential(env, props.credentialId);
-  return operation(new DavClient(config, getDavConfig(env)));
+async function selectUserDav(
+  env: AppEnv,
+  props: AuthProps,
+  accountId: string | undefined,
+  capability: Extract<AccountCapability, "calendar" | "contacts">,
+): Promise<{ client: DavClient; account: AccountSummary }> {
+  const selected = await resolveAccount(env, props, accountId, capability);
+  if (selected.account.preset !== "icloud") throw new Error("Custom DAV servers are not supported");
+  return { client: new DavClient(selected.account.config, getDavConfig(env)), account: selected.summary };
 }
 
 function serviceDomain(env: AppEnv, service: "calendar" | "contacts"): string {
@@ -130,14 +137,15 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
   server.registerTool(
     "list_calendars",
     {
-      description: "List live iCloud CalDAV calendars and their supported event/reminder component types.",
-      inputSchema: {},
+      description: "List live iCloud CalDAV calendars for one configured account and their supported component types.",
+      inputSchema: { accountId: accountIdSchema },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async () => withToolSpan("list_calendars", async () => {
+    async ({ accountId }) => withToolSpan("list_calendars", async () => {
       try {
         requireScope(props, "calendar.read");
-        return textResult({ calendars: await withUserDav(env, props, (client) => client.listCalendars()) });
+        const selected = await selectUserDav(env, props, accountId, "calendar");
+        return textResult({ calendars: await selected.client.listCalendars(), account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -149,6 +157,7 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
     {
       description: "List live iCloud CalDAV VEVENT and VTODO resources with bounded structured fields and signed stateless cursors.",
       inputSchema: {
+        accountId: accountIdSchema,
         calendarHref: hrefSchema.optional(),
         componentType: z.enum(["VEVENT", "VTODO", "any"]).optional().default("any"),
         text: z.string().max(QUERY_MAX).refine((value) => !hasHeaderControl(value), "Invalid text").optional(),
@@ -159,7 +168,7 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ calendarHref, componentType, text, start, end, cursor, limit }) => withToolSpan("list_calendar_items", async () => {
+    async ({ accountId, calendarHref, componentType, text, start, end, cursor, limit }) => withToolSpan("list_calendar_items", async () => {
       try {
         requireScope(props, "calendar.read");
         const query = {
@@ -169,15 +178,16 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
           start,
           end,
         };
-        const fingerprint = await cursorFingerprint({ ...query, limit });
+        const selected = await selectUserDav(env, props, accountId, "calendar");
+        const fingerprint = await cursorFingerprint({ accountId: selected.account.accountId, ...query, limit });
         const secret = getCredentialsEncryptionSecret(env);
         const domain = serviceDomain(env, "calendar");
         const afterHref = await cursorAfter(cursor, domain, fingerprint, secret);
-        const page = await withUserDav(env, props, (client) => client.listCalendarItems(query, afterHref, limit));
+        const page = await selected.client.listCalendarItems(query, afterHref, limit);
         const nextCursor = page.hasMore && page.lastHref
           ? await encodeDavCursor(domain, fingerprint, page.lastHref, secret)
           : null;
-        return textResult({ items: page.items, errors: page.errors, nextCursor });
+        return textResult({ items: page.items, errors: page.errors, nextCursor, account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -188,13 +198,14 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
     "get_calendar_item",
     {
       description: "Fetch one live iCloud CalDAV VEVENT or VTODO resource by canonical href.",
-      inputSchema: { href: hrefSchema },
+      inputSchema: { accountId: accountIdSchema, href: hrefSchema },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ href }) => withToolSpan("get_calendar_item", async () => {
+    async ({ accountId, href }) => withToolSpan("get_calendar_item", async () => {
       try {
         requireScope(props, "calendar.read");
-        return textResult(await withUserDav(env, props, (client) => client.getCalendarItem(href)));
+        const selected = await selectUserDav(env, props, accountId, "calendar");
+        return textResult({ ...await selected.client.getCalendarItem(href), account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -206,15 +217,17 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
     {
       description: "Create a VEVENT or VTODO in a live iCloud CalDAV calendar; an optional raw iCalendar body is authoritative.",
       inputSchema: {
+        accountId: accountIdSchema,
         calendarHref: hrefSchema,
         ...calendarInputSchema.shape,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ calendarHref, ...input }) => withToolSpan("create_calendar_item", async () => {
+    async ({ accountId, calendarHref, ...input }) => withToolSpan("create_calendar_item", async () => {
       try {
         requireScope(props, "calendar.write");
-        return textResult(await withUserDav(env, props, (client) => client.createCalendarItem(calendarHref, input as CalendarItemInput)));
+        const selected = await selectUserDav(env, props, accountId, "calendar");
+        return textResult({ ...await selected.client.createCalendarItem(calendarHref, input as CalendarItemInput), account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -226,17 +239,19 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
     {
       description: "Update a live iCloud CalDAV resource with a required current ETag; stale writes are rejected.",
       inputSchema: {
+        accountId: accountIdSchema,
         href: hrefSchema,
         etag: etagSchema,
         ...calendarInputSchema.shape,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ href, etag, ...input }) => withToolSpan("update_calendar_item", async () => {
+    async ({ accountId, href, etag, ...input }) => withToolSpan("update_calendar_item", async () => {
       try {
         requireScope(props, "calendar.write");
         if (!input.rawIcalendar && !input.uid) throw new Error("An update requires rawIcalendar or uid");
-        return textResult(await withUserDav(env, props, (client) => client.updateCalendarItem(href, etag, input as CalendarItemInput)));
+        const selected = await selectUserDav(env, props, accountId, "calendar");
+        return textResult({ ...await selected.client.updateCalendarItem(href, etag, input as CalendarItemInput), account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -247,14 +262,15 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
     "delete_calendar_item",
     {
       description: "Delete a live iCloud CalDAV resource only with its current ETag and explicit delete confirmation.",
-      inputSchema: { href: hrefSchema, etag: etagSchema, confirm: deleteConfirmationSchema },
+      inputSchema: { accountId: accountIdSchema, href: hrefSchema, etag: etagSchema, confirm: deleteConfirmationSchema },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ href, etag }) => withToolSpan("delete_calendar_item", async () => {
+    async ({ accountId, href, etag }) => withToolSpan("delete_calendar_item", async () => {
       try {
         requireScope(props, "calendar.write");
-        await withUserDav(env, props, (client) => client.deleteCalendarItem(href, etag));
-        return textResult({ deleted: true, href });
+        const selected = await selectUserDav(env, props, accountId, "calendar");
+        await selected.client.deleteCalendarItem(href, etag);
+        return textResult({ deleted: true, href, account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -265,13 +281,14 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
     "list_address_books",
     {
       description: "List live iCloud CardDAV address books and supported vCard versions.",
-      inputSchema: {},
+      inputSchema: { accountId: accountIdSchema },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async () => withToolSpan("list_address_books", async () => {
+    async ({ accountId }) => withToolSpan("list_address_books", async () => {
       try {
         requireScope(props, "contacts.read");
-        return textResult({ addressBooks: await withUserDav(env, props, (client) => client.listAddressBooks()) });
+        const selected = await selectUserDav(env, props, accountId, "contacts");
+        return textResult({ addressBooks: await selected.client.listAddressBooks(), account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -283,6 +300,7 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
     {
       description: "List live iCloud CardDAV contacts with bounded structured fields and signed stateless cursors.",
       inputSchema: {
+        accountId: accountIdSchema,
         addressBookHref: hrefSchema.optional(),
         query: z.string().max(QUERY_MAX).refine((value) => !hasHeaderControl(value), "Invalid query").optional(),
         cursor: z.string().max(4_200).optional(),
@@ -290,22 +308,23 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ addressBookHref, query, cursor, limit }) => withToolSpan("list_contacts", async () => {
+    async ({ accountId, addressBookHref, query, cursor, limit }) => withToolSpan("list_contacts", async () => {
       try {
         requireScope(props, "contacts.read");
         const normalizedQuery = {
           addressBookHref: normalized(addressBookHref),
           query: normalized(query),
         };
-        const fingerprint = await cursorFingerprint({ ...normalizedQuery, limit });
+        const selected = await selectUserDav(env, props, accountId, "contacts");
+        const fingerprint = await cursorFingerprint({ accountId: selected.account.accountId, ...normalizedQuery, limit });
         const secret = getCredentialsEncryptionSecret(env);
         const domain = serviceDomain(env, "contacts");
         const afterHref = await cursorAfter(cursor, domain, fingerprint, secret);
-        const page = await withUserDav(env, props, (client) => client.listContacts(normalizedQuery, afterHref, limit));
+        const page = await selected.client.listContacts(normalizedQuery, afterHref, limit);
         const nextCursor = page.hasMore && page.lastHref
           ? await encodeDavCursor(domain, fingerprint, page.lastHref, secret)
           : null;
-        return textResult({ contacts: page.items, errors: page.errors, nextCursor });
+        return textResult({ contacts: page.items, errors: page.errors, nextCursor, account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -316,13 +335,14 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
     "get_contact",
     {
       description: "Fetch one live iCloud CardDAV contact by canonical href.",
-      inputSchema: { href: hrefSchema },
+      inputSchema: { accountId: accountIdSchema, href: hrefSchema },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ href }) => withToolSpan("get_contact", async () => {
+    async ({ accountId, href }) => withToolSpan("get_contact", async () => {
       try {
         requireScope(props, "contacts.read");
-        return textResult(await withUserDav(env, props, (client) => client.getContact(href)));
+        const selected = await selectUserDav(env, props, accountId, "contacts");
+        return textResult({ ...await selected.client.getContact(href), account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -334,15 +354,17 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
     {
       description: "Create a live iCloud CardDAV contact; an optional raw vCard body is authoritative.",
       inputSchema: {
+        accountId: accountIdSchema,
         addressBookHref: hrefSchema,
         ...contactInputSchema.shape,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ addressBookHref, ...input }) => withToolSpan("create_contact", async () => {
+    async ({ accountId, addressBookHref, ...input }) => withToolSpan("create_contact", async () => {
       try {
         requireScope(props, "contacts.write");
-        return textResult(await withUserDav(env, props, (client) => client.createContact(addressBookHref, input as ContactInput)));
+        const selected = await selectUserDav(env, props, accountId, "contacts");
+        return textResult({ ...await selected.client.createContact(addressBookHref, input as ContactInput), account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -354,17 +376,19 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
     {
       description: "Update a live iCloud CardDAV contact with a required current ETag; stale writes are rejected.",
       inputSchema: {
+        accountId: accountIdSchema,
         href: hrefSchema,
         etag: etagSchema,
         ...contactInputSchema.shape,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ href, etag, ...input }) => withToolSpan("update_contact", async () => {
+    async ({ accountId, href, etag, ...input }) => withToolSpan("update_contact", async () => {
       try {
         requireScope(props, "contacts.write");
         if (!input.rawVcard && !input.uid && !input.formattedName && !input.name) throw new Error("An update requires rawVcard or contact fields");
-        return textResult(await withUserDav(env, props, (client) => client.updateContact(href, etag, input as ContactInput)));
+        const selected = await selectUserDav(env, props, accountId, "contacts");
+        return textResult({ ...await selected.client.updateContact(href, etag, input as ContactInput), account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -375,14 +399,15 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
     "delete_contact",
     {
       description: "Delete a live iCloud CardDAV contact only with its current ETag and explicit delete confirmation.",
-      inputSchema: { href: hrefSchema, etag: etagSchema, confirm: deleteConfirmationSchema },
+      inputSchema: { accountId: accountIdSchema, href: hrefSchema, etag: etagSchema, confirm: deleteConfirmationSchema },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ href, etag }) => withToolSpan("delete_contact", async () => {
+    async ({ accountId, href, etag }) => withToolSpan("delete_contact", async () => {
       try {
         requireScope(props, "contacts.write");
-        await withUserDav(env, props, (client) => client.deleteContact(href, etag));
-        return textResult({ deleted: true, href });
+        const selected = await selectUserDav(env, props, accountId, "contacts");
+        await selected.client.deleteContact(href, etag);
+        return textResult({ deleted: true, href, account: selected.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }

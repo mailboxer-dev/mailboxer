@@ -3,14 +3,31 @@ import {
   type AuthRequest,
 } from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
-import { getCredentialsEncryptionSecret } from "./config";
 import {
-  MailCredentialError,
-  storeMailCredentials,
-  verifyMailCredentials,
-} from "./credentials";
+  AccountVaultError,
+  addDraftAccount,
+  commitAccountDraft,
+  deleteAccountDraft,
+  loadAccountDraft,
+  newAccountDraft,
+  removeDraftAccount,
+  replaceDraftAccount,
+  saveAccountDraft,
+  setDraftDefault,
+  unlockAccountDraft,
+  verifyAccountSubmission,
+  type AccountDraft,
+  type AccountSubmission,
+} from "./accounts";
+import { getCredentialsEncryptionSecret } from "./config";
+import { MailCredentialError } from "./credentials";
 import { logFailure } from "./diagnostics";
-import { RESOURCE_SCOPES, type MailCredentials, type OAuthEnv } from "./types";
+import {
+  RESOURCE_SCOPES,
+  type AccountCapabilities,
+  type OAuthEnv,
+  type StoredMailAccount,
+} from "./types";
 
 const AUTH_STATE_TTL_SECONDS = 600;
 const MAX_AUTH_ATTEMPTS = 5;
@@ -18,16 +35,21 @@ const MAX_FORM_BYTES = 16 * 1024;
 const STATE_KEY_PREFIX = "mail-oauth:state:";
 const STATE_COOKIE_NAME = "mcp_oauth_state";
 const AUTH_SCOPES = [...RESOURCE_SCOPES, "offline_access"] as const;
+const STATE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/u;
+
+type WizardMode = "create" | "manage";
+type AccountFormTarget = "start" | "add" | "edit";
 
 interface StoredAuthState {
   request: AuthRequest;
   clientName: string;
   attempts: number;
+  grantedScopes?: string[];
+  mode?: WizardMode;
 }
 
 export interface CredentialAuthDependencies {
-  verifyCredentials?: (env: OAuthEnv, input: unknown, scopes: readonly string[]) => Promise<MailCredentials>;
-  storeCredentials?: (env: OAuthEnv, credentials: MailCredentials) => Promise<string>;
+  verifyAccountSubmission?: typeof verifyAccountSubmission;
 }
 
 const authRequestSchema = z.object({
@@ -40,12 +62,14 @@ const authRequestSchema = z.object({
   codeChallengeMethod: z.string().optional(),
   resource: z.union([z.string(), z.array(z.string())]).optional(),
   issuer: z.string().optional(),
-});
+}).passthrough();
 
 const storedStateSchema = z.object({
   request: authRequestSchema,
   clientName: z.string().max(256),
   attempts: z.number().int().min(0).max(MAX_AUTH_ATTEMPTS),
+  grantedScopes: z.array(z.string()).max(AUTH_SCOPES.length).optional(),
+  mode: z.enum(["create", "manage"]).optional(),
 });
 
 function base64UrlEncode(bytes: Uint8Array): string {
@@ -195,7 +219,7 @@ function escapeHtml(value: string): string {
 
 function asStoredState(value: unknown): StoredAuthState | null {
   const parsed = storedStateSchema.safeParse(value);
-  return parsed.success ? parsed.data : null;
+  return parsed.success ? parsed.data as StoredAuthState : null;
 }
 
 function requestedScopes(request: AuthRequest): Array<(typeof AUTH_SCOPES)[number]> {
@@ -216,71 +240,272 @@ function scopeLabel(scope: (typeof AUTH_SCOPES)[number]): string {
   return "Keep the connection active with refresh tokens";
 }
 
-function renderLoginPage(
-  state: string,
-  stored: StoredAuthState,
-  errorMessage?: string,
-  emailValue = "",
-): string {
-  const requested = new Set(requestedScopes(stored.request));
-  const scopeInputs = AUTH_SCOPES.map((scope) => {
-    const isRequested = requested.has(scope);
-    const unavailable = isRequested ? "" : " disabled";
-    const availability = isRequested ? "" : " <small class=\"hint\">Not requested by this client</small>";
-    return `
+function scopeConsent(request: AuthRequest, selected: readonly string[]): string {
+  const requested = requestedScopes(request);
+  const selectedSet = new Set(selected);
+  const inputs = requested.map((scope) => `
         <label class="scope">
-          <input type="checkbox" name="scope" value="${escapeHtml(scope)}"${isRequested ? " checked" : ""}${unavailable}>
-          <span><strong>${escapeHtml(scope)}</strong>${availability}<br>${escapeHtml(scopeLabel(scope))}</span>
-        </label>`;
-  }).join("");
+          <input type="checkbox" name="scope" value="${escapeHtml(scope)}"${selectedSet.has(scope) ? " checked" : ""}>
+          <span><strong>${escapeHtml(scope)}</strong><br>${escapeHtml(scopeLabel(scope))}</span>
+        </label>`).join("");
+  return `
+      <fieldset>
+        <legend>Permissions</legend>
+        <p class="hint">Choose the permissions to grant to this Email MCP connection. Only permissions requested by the MCP client are shown.</p>
+        <input type="hidden" name="scope_form" value="1">
+        ${inputs}
+      </fieldset>`;
+}
+
+interface AccountFormValues {
+  preset: "icloud" | "custom";
+  label: string;
+  address: string;
+  enableMail: boolean;
+  enableCalendar: boolean;
+  enableContacts: boolean;
+  imapHost: string;
+  imapPort: string;
+  imapTlsMode: "implicit" | "starttls";
+  imapUser: string;
+  smtpHost: string;
+  smtpPort: string;
+  smtpTlsMode: "implicit" | "starttls";
+  smtpUser: string;
+  sameSmtpCredentials: boolean;
+}
+
+function firstValue(form: URLSearchParams | undefined, names: readonly string[]): string {
+  if (!form) return "";
+  for (const name of names) {
+    const value = form.get(name);
+    if (value !== null) return value;
+  }
+  return "";
+}
+
+function accountFormValues(form?: URLSearchParams, existing?: StoredMailAccount): AccountFormValues {
+  const config = existing?.config;
+  const serviceOptionsPresent = form?.get("service_options_present") === "1";
+  const customFieldsPresent = form?.get("custom_fields_present") === "1";
+  const presetValue = firstValue(form, ["preset"]);
+  const preset = presetValue === "custom" || (!presetValue && existing?.preset === "custom") ? "custom" : "icloud";
+  return {
+    preset,
+    label: firstValue(form, ["label", "account_label"]) || existing?.label || "",
+    address: firstValue(form, ["address", "email", "icloud_email"]) || existing?.address || "",
+    enableMail: serviceOptionsPresent ? Boolean(form?.get("enable_mail")) : existing?.capabilities.mail ?? true,
+    enableCalendar: serviceOptionsPresent ? Boolean(form?.get("enable_calendar")) : existing?.capabilities.calendar ?? false,
+    enableContacts: serviceOptionsPresent ? Boolean(form?.get("enable_contacts")) : existing?.capabilities.contacts ?? false,
+    imapHost: firstValue(form, ["imap_host"]) || config?.imapHost || "",
+    imapPort: firstValue(form, ["imap_port"]) || (config?.imapPort ? String(config.imapPort) : "993"),
+    imapTlsMode: firstValue(form, ["imap_tls_mode"]) === "starttls" || config?.imapTlsMode === "starttls" ? "starttls" : "implicit",
+    imapUser: firstValue(form, ["imap_user"]) || config?.imapUser || "",
+    smtpHost: firstValue(form, ["smtp_host"]) || config?.smtpHost || "",
+    smtpPort: firstValue(form, ["smtp_port"]) || (config?.smtpPort ? String(config.smtpPort) : "587"),
+    smtpTlsMode: firstValue(form, ["smtp_tls_mode"]) === "implicit" || config?.smtpTlsMode === "implicit" ? "implicit" : "starttls",
+    smtpUser: firstValue(form, ["smtp_user"]) || config?.smtpUser || "",
+    sameSmtpCredentials: customFieldsPresent
+      ? Boolean(form?.get("same_smtp_credentials"))
+      : config ? config.smtpUser === config.imapUser && config.smtpPassword === config.password : true,
+  };
+}
+
+function accountFields(form?: URLSearchParams, existing?: StoredMailAccount): string {
+  const values = accountFormValues(form, existing);
+  const checked = (value: boolean): string => value ? " checked" : "";
+  const selected = (value: string, expected: string): string => value === expected ? " selected" : "";
+  return `
+        <label for="label">Account name</label>
+        <input id="label" name="label" type="text" maxlength="80" value="${escapeHtml(values.label)}" required>
+        <label for="address">Email address</label>
+        <input id="address" name="address" type="email" autocomplete="username" maxlength="320" value="${escapeHtml(values.address)}" required>
+        <label for="preset">Provider</label>
+        <select id="preset" name="preset">
+          <option value="icloud"${selected(values.preset, "icloud")}>iCloud preset</option>
+          <option value="custom"${selected(values.preset, "custom")}>Custom IMAP/SMTP</option>
+        </select>
+
+        <fieldset>
+          <legend>Services</legend>
+          <input type="hidden" name="service_options_present" value="1">
+          <label class="check"><input type="checkbox" name="enable_mail" value="1"${checked(values.enableMail)}> Mail</label>
+          <label class="check"><input type="checkbox" name="enable_calendar" value="1"${checked(values.enableCalendar)}${values.preset === "custom" ? " disabled" : ""}> Calendar and reminders</label>
+          <label class="check"><input type="checkbox" name="enable_contacts" value="1"${checked(values.enableContacts)}${values.preset === "custom" ? " disabled" : ""}> Contacts</label>
+        </fieldset>
+
+        <section class="provider-fields">
+          <h2>iCloud preset</h2>
+          <p class="hint">Uses iCloud IMAP, SMTP, CalDAV, and CardDAV endpoints. Use an Apple app-specific password.</p>
+          <label for="app_password">Apple app-specific password</label>
+          <input id="app_password" name="app_password" type="password" autocomplete="current-password" maxlength="256">
+        </section>
+
+        <section class="provider-fields">
+          <h2>Custom IMAP/SMTP</h2>
+          <input type="hidden" name="custom_fields_present" value="1">
+          <label for="imap_host">IMAP hostname</label>
+          <input id="imap_host" name="imap_host" type="text" maxlength="253" value="${escapeHtml(values.imapHost)}">
+          <label for="imap_port">IMAP port</label>
+          <input id="imap_port" name="imap_port" type="number" min="1" max="65535" value="${escapeHtml(values.imapPort)}">
+          <label for="imap_tls_mode">IMAP TLS</label>
+          <select id="imap_tls_mode" name="imap_tls_mode">
+            <option value="implicit"${selected(values.imapTlsMode, "implicit")}>Implicit TLS (993)</option>
+            <option value="starttls"${selected(values.imapTlsMode, "starttls")}>STARTTLS (143)</option>
+          </select>
+          <label for="imap_user">IMAP username</label>
+          <input id="imap_user" name="imap_user" type="text" maxlength="320" value="${escapeHtml(values.imapUser)}">
+          <label for="imap_password">IMAP password</label>
+          <input id="imap_password" name="imap_password" type="password" autocomplete="current-password" maxlength="256">
+          <label for="smtp_host">SMTP hostname</label>
+          <input id="smtp_host" name="smtp_host" type="text" maxlength="253" value="${escapeHtml(values.smtpHost)}">
+          <label for="smtp_port">SMTP port</label>
+          <input id="smtp_port" name="smtp_port" type="number" min="1" max="65535" value="${escapeHtml(values.smtpPort)}">
+          <label for="smtp_tls_mode">SMTP TLS</label>
+          <select id="smtp_tls_mode" name="smtp_tls_mode">
+            <option value="implicit"${selected(values.smtpTlsMode, "implicit")}>Implicit TLS (465)</option>
+            <option value="starttls"${selected(values.smtpTlsMode, "starttls")}>STARTTLS (587 or 2525)</option>
+          </select>
+          <label for="smtp_user">SMTP username</label>
+          <input id="smtp_user" name="smtp_user" type="text" maxlength="320" value="${escapeHtml(values.smtpUser)}">
+          <label for="smtp_password">SMTP password</label>
+          <input id="smtp_password" name="smtp_password" type="password" autocomplete="current-password" maxlength="256">
+          <label class="check"><input type="checkbox" name="same_smtp_credentials" value="1"${checked(values.sameSmtpCredentials)}> Use the IMAP username and password for SMTP</label>
+        </section>`;
+}
+
+function renderPageShell(title: string, clientName: string, content: string, errorMessage?: string): string {
   const error = errorMessage ? `<p class="error" role="alert">${escapeHtml(errorMessage)}</p>` : "";
   return `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Authorize iCloud MCP</title>
+    <title>${escapeHtml(title)}</title>
     <style>
       :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
       body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f6f8; color: #172033; }
-      main { width: min(36rem, calc(100% - 2rem)); box-sizing: border-box; padding: 2rem; border: 1px solid #d9dde7; border-radius: 1rem; background: white; box-shadow: 0 1rem 3rem #17203318; }
-      h1 { margin-top: 0; font-size: 1.5rem; }
-      p { line-height: 1.5; }
-      .scope { display: flex; gap: .75rem; align-items: flex-start; padding: .75rem; margin: .5rem 0; border: 1px solid #d9dde7; border-radius: .6rem; }
-      .scope input { margin-top: .25rem; }
-      label[for="icloud_email"], label[for="icloud_app_password"] { display: block; margin-top: 1.25rem; font-weight: 600; }
-      input[type="email"], input[type="password"] { box-sizing: border-box; width: 100%; margin-top: .5rem; padding: .7rem; border: 1px solid #aeb5c5; border-radius: .5rem; font: inherit; }
-      .hint { color: #526078; font-size: .92rem; }
-      .actions { display: flex; gap: .75rem; margin-top: 1.5rem; }
-      button { flex: 1; padding: .7rem 1rem; border: 0; border-radius: .5rem; font: inherit; cursor: pointer; }
-      button[value="approve"] { background: #2563eb; color: white; }
-      button[value="deny"] { background: #e7eaf0; color: #172033; }
-      .error { padding: .75rem; border-radius: .5rem; background: #fee2e2; color: #991b1b; }
-      @media (prefers-color-scheme: dark) { body { background: #111827; color: #eef2ff; } main { background: #1f2937; border-color: #4b5563; } .scope { border-color: #4b5563; } input[type="email"], input[type="password"] { background: #111827; color: #eef2ff; border-color: #6b7280; } button[value="deny"] { background: #374151; color: #eef2ff; } .error { background: #451a1a; color: #fecaca; } .hint { color: #c0c9da; } }
+      main { width: min(48rem, calc(100% - 2rem)); box-sizing: border-box; padding: 2rem; border: 1px solid #d9dde7; border-radius: 1rem; background: white; box-shadow: 0 1rem 3rem #17203318; }
+      h1 { margin-top: 0; font-size: 1.5rem; } h2 { font-size: 1.05rem; margin-bottom: .5rem; }
+      p { line-height: 1.5; } label { display: block; margin-top: 1rem; font-weight: 600; }
+      fieldset { margin: 1.25rem 0; padding: .85rem; border: 1px solid #d9dde7; border-radius: .6rem; }
+      legend { padding: 0 .35rem; font-weight: 700; } .scope { display: flex; gap: .75rem; align-items: flex-start; padding: .7rem; margin: .45rem 0; border: 1px solid #d9dde7; border-radius: .6rem; }
+      .scope input, .check input { margin-top: .25rem; } .check { font-weight: 400; }
+      input[type="email"], input[type="password"], input[type="text"], input[type="number"], select { box-sizing: border-box; width: 100%; margin-top: .4rem; padding: .65rem; border: 1px solid #aeb5c5; border-radius: .5rem; font: inherit; }
+      .hint { color: #526078; font-size: .92rem; } .error { padding: .75rem; border-radius: .5rem; background: #fee2e2; color: #991b1b; }
+      .provider-fields { border-top: 1px solid #e2e6ee; margin-top: 1.25rem; padding-top: .5rem; }
+      .account { padding: .85rem; margin: .6rem 0; border: 1px solid #d9dde7; border-radius: .6rem; }
+      .account strong { display: block; } .account-actions, .actions { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: .75rem; }
+      button { padding: .65rem 1rem; border: 0; border-radius: .5rem; font: inherit; cursor: pointer; } button.primary { background: #2563eb; color: white; }
+      button.secondary { background: #e7eaf0; color: #172033; } button.danger { background: #b91c1c; color: white; }
+      @media (prefers-color-scheme: dark) { body { background: #111827; color: #eef2ff; } main { background: #1f2937; border-color: #4b5563; } fieldset, .scope, .account { border-color: #4b5563; } input, select { background: #111827; color: #eef2ff; border-color: #6b7280; } .error { background: #451a1a; color: #fecaca; } .hint { color: #c0c9da; } button.secondary { background: #374151; color: #eef2ff; } }
     </style>
   </head>
-  <body>
-    <main>
-      <h1>Authorize iCloud MCP</h1>
-      <p><strong>${escapeHtml(stored.clientName || "MCP client")}</strong> is requesting access to this Worker.</p>
-      ${error}
-      <form method="post" action="/authorize">
-        <input type="hidden" name="authorization_state" value="${escapeHtml(state)}">
-        <p>Choose the permissions to grant. Disabled permissions were not requested by this MCP client; reconnect it after refreshing its OAuth configuration to request them.</p>
-        ${scopeInputs}
-        <label for="icloud_email">iCloud email address</label>
-        <input id="icloud_email" name="icloud_email" type="email" autocomplete="username" maxlength="320" value="${escapeHtml(emailValue.slice(0, 320))}" required>
-        <label for="icloud_app_password">Apple app-specific password</label>
-        <input id="icloud_app_password" name="icloud_app_password" type="password" autocomplete="current-password" maxlength="256" required>
-        <p class="hint">Use an Apple app-specific password, not your normal Apple Account password. The Worker verifies the requested iCloud services and stores the credentials encrypted.</p>
-        <div class="actions">
-          <button type="submit" name="decision" value="deny">Cancel</button>
-          <button type="submit" name="decision" value="approve">Authorize</button>
-        </div>
-      </form>
-    </main>
-  </body>
+  <body><main><h1>${escapeHtml(title)}</h1><p><strong>${escapeHtml(clientName || "MCP client")}</strong> is requesting access to this Email MCP.</p>${error}${content}</main></body>
 </html>`;
+}
+
+function hiddenState(state: string, mode?: WizardMode, target?: AccountFormTarget, accountId?: string): string {
+  return `<input type="hidden" name="authorization_state" value="${escapeHtml(state)}">${mode ? `<input type="hidden" name="mode" value="${mode}">` : ""}${target ? `<input type="hidden" name="target" value="${target}">` : ""}${accountId ? `<input type="hidden" name="account_id" value="${escapeHtml(accountId)}">` : ""}`;
+}
+
+function renderStartPage(
+  state: string,
+  stored: StoredAuthState,
+  selectedScopes: readonly string[],
+  errorMessage?: string,
+  form?: URLSearchParams,
+): string {
+  const mode = firstValue(form, ["mode", "profile_mode"]) === "manage" ? "manage" : "create";
+  const content = `<form method="post" action="/authorize">
+        ${hiddenState(state, undefined, "start")}
+        ${scopeConsent(stored.request, selectedScopes)}
+        <label for="mode">Profile action</label>
+        <select id="mode" name="mode">
+          <option value="create"${mode === "create" ? " selected" : ""}>Create a new profile</option>
+          <option value="manage"${mode === "manage" ? " selected" : ""}>Manage an existing profile</option>
+        </select>
+        <p class="hint">Create starts a new profile with the verified account. Manage unlocks an existing profile by verifying any one of its live accounts.</p>
+        ${accountFields(form)}
+        <div class="actions">
+          <button class="secondary" type="submit" name="decision" value="deny">Cancel</button>
+          <button class="primary" type="submit" name="action" value="verify">${mode === "manage" ? "Unlock profile" : "Verify and continue"}</button>
+        </div>
+      </form>`;
+  return renderPageShell("Email MCP", stored.clientName, content, errorMessage);
+}
+
+function renderAccountFormPage(
+  state: string,
+  stored: StoredAuthState,
+  draft: AccountDraft,
+  target: "add" | "edit",
+  selectedScopes: readonly string[],
+  errorMessage?: string,
+  form?: URLSearchParams,
+  existing?: StoredMailAccount,
+): string {
+  const heading = target === "add" ? "Add an account" : "Edit an account";
+  const content = `<form method="post" action="/authorize">
+        ${hiddenState(state, "manage", target, existing?.accountId)}
+        ${scopeConsent(stored.request, selectedScopes)}
+        <p class="hint">Account changes are held in this encrypted reconnect draft until you choose Continue.</p>
+        ${accountFields(form, existing)}
+        <div class="actions">
+          <button class="secondary" type="submit" name="action" value="list">Back to accounts</button>
+          <button class="primary" type="submit" name="action" value="verify">Verify and save draft</button>
+        </div>
+      </form>`;
+  return renderPageShell(heading, stored.clientName, content, errorMessage);
+}
+
+function capabilityText(capabilities: AccountCapabilities, selectedScopes: readonly string[]): string {
+  const hasScope = (prefix: "mail" | "calendar" | "contacts"): boolean => selectedScopes.some((scope) => scope.startsWith(`${prefix}.`));
+  const label = (name: string, prefix: "mail" | "calendar" | "contacts"): string => (
+    hasScope(prefix) ? name : `${name} (unavailable until the MCP client requests its OAuth scope)`
+  );
+  return [
+    capabilities.mail ? label("Mail", "mail") : "",
+    capabilities.calendar ? label("Calendar", "calendar") : "",
+    capabilities.contacts ? label("Contacts", "contacts") : "",
+  ].filter(Boolean).join(", ");
+}
+
+function renderManagementPage(
+  state: string,
+  stored: StoredAuthState,
+  draft: AccountDraft,
+  selectedScopes: readonly string[],
+  message?: string,
+): string {
+  const accountList = draft.accounts.map((account) => `<article class="account">
+          <strong>${escapeHtml(account.label)}${account.accountId === draft.defaultAccountId ? " (default)" : ""}</strong>
+          <span>${escapeHtml(account.address)}</span><br>
+          <span class="hint">${escapeHtml(account.preset === "icloud" ? "iCloud preset" : "Custom IMAP/SMTP")} · ${escapeHtml(capabilityText(account.capabilities, selectedScopes) || "No services")}</span>
+          <form class="account-actions" method="post" action="/authorize">
+            ${hiddenState(state, "manage")}
+            <input type="hidden" name="account_id" value="${escapeHtml(account.accountId)}">
+            ${selectedScopes.map((scope) => `<input type="hidden" name="scope" value="${escapeHtml(scope)}">`).join("")}
+            <input type="hidden" name="scope_form" value="1">
+            <button class="secondary" type="submit" name="action" value="test">Test</button>
+            <button class="secondary" type="submit" name="action" value="edit">Edit</button>
+            ${account.accountId === draft.defaultAccountId ? "" : `<button class="secondary" type="submit" name="action" value="set_default">Make default</button>`}
+            <button class="danger" type="submit" name="action" value="remove">Remove</button>
+          </form>
+        </article>`).join("");
+  const content = `${message ? `<p class="hint" role="status">${escapeHtml(message)}</p>` : ""}
+        <p>Manage the accounts attached to this Email MCP profile. The verified account details are stored encrypted; mailbox, calendar, and contact content is never stored here.</p>
+        ${accountList}
+        <form method="post" action="/authorize">
+        ${hiddenState(state, "manage")}
+        ${scopeConsent(stored.request, selectedScopes)}
+        <div class="actions">
+          <button class="secondary" type="submit" name="action" value="add">Add account</button>
+          <button class="primary" type="submit" name="action" value="continue">Continue</button>
+          <button class="secondary" type="submit" name="decision" value="deny">Cancel</button>
+        </div>
+      </form>`;
+  return renderPageShell("Manage Email MCP accounts", stored.clientName, content);
 }
 
 async function readBoundedBody(request: Request): Promise<Uint8Array> {
@@ -326,6 +551,106 @@ function assertCredentialConfiguration(env: OAuthEnv): void {
   if (!env.MAIL_CREDENTIALS_KV) throw new Error("MAIL_CREDENTIALS_KV binding is not configured");
 }
 
+async function persistAuthState(env: OAuthEnv, state: string, stored: StoredAuthState): Promise<void> {
+  await env.OAUTH_KV.put(`${STATE_KEY_PREFIX}${state}`, JSON.stringify(stored), {
+    expirationTtl: AUTH_STATE_TTL_SECONDS,
+  });
+}
+
+async function deleteWizardState(env: OAuthEnv, state: string): Promise<void> {
+  await Promise.all([
+    env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${state}`),
+    deleteAccountDraft(env, state),
+  ]);
+}
+
+function accountSubmissionFromForm(form: URLSearchParams): AccountSubmission {
+  const preset = firstValue(form, ["preset"]);
+  if (preset !== "icloud" && preset !== "custom") throw new AccountVaultError("Select a supported account provider");
+  const numberValue = (name: string): number | undefined => {
+    const value = form.get(name);
+    if (value === null || value.trim() === "") return undefined;
+    return Number(value);
+  };
+  const serviceOptionsPresent = form.get("service_options_present") === "1";
+  const customFieldsPresent = form.get("custom_fields_present") === "1";
+  return {
+    preset,
+    label: firstValue(form, ["label", "account_label"]),
+    address: firstValue(form, ["address", "email", "icloud_email"]),
+    appPassword: firstValue(form, ["app_password", "icloud_app_password"]) || undefined,
+    enableMail: serviceOptionsPresent ? form.has("enable_mail") : undefined,
+    enableCalendar: serviceOptionsPresent ? form.has("enable_calendar") : undefined,
+    enableContacts: serviceOptionsPresent ? form.has("enable_contacts") : undefined,
+    imapHost: firstValue(form, ["imap_host"]) || undefined,
+    imapPort: numberValue("imap_port"),
+    imapTlsMode: firstValue(form, ["imap_tls_mode"]) === "starttls" ? "starttls" : firstValue(form, ["imap_tls_mode"]) === "implicit" ? "implicit" : undefined,
+    imapUser: firstValue(form, ["imap_user"]) || undefined,
+    imapPassword: firstValue(form, ["imap_password"]) || undefined,
+    smtpHost: firstValue(form, ["smtp_host"]) || undefined,
+    smtpPort: numberValue("smtp_port"),
+    smtpTlsMode: firstValue(form, ["smtp_tls_mode"]) === "implicit" ? "implicit" : firstValue(form, ["smtp_tls_mode"]) === "starttls" ? "starttls" : undefined,
+    smtpUser: firstValue(form, ["smtp_user"]) || undefined,
+    smtpPassword: firstValue(form, ["smtp_password"]) || undefined,
+    sameSmtpCredentials: customFieldsPresent ? form.has("same_smtp_credentials") : undefined,
+  };
+}
+
+function accountSubmissionFromStored(account: StoredMailAccount): AccountSubmission {
+  const { config } = account;
+  if (account.preset === "icloud") {
+    return {
+      preset: "icloud",
+      label: account.label,
+      address: account.address,
+      appPassword: config.password,
+      enableMail: account.capabilities.mail,
+      enableCalendar: account.capabilities.calendar,
+      enableContacts: account.capabilities.contacts,
+    };
+  }
+  return {
+    preset: "custom",
+    label: account.label,
+    address: account.address,
+    enableMail: account.capabilities.mail,
+    enableCalendar: false,
+    enableContacts: false,
+    imapHost: config.imapHost,
+    imapPort: config.imapPort,
+    imapTlsMode: config.imapTlsMode,
+    imapUser: config.imapUser,
+    imapPassword: config.password,
+    smtpHost: config.smtpHost,
+    smtpPort: config.smtpPort,
+    smtpTlsMode: config.smtpTlsMode,
+    smtpUser: config.smtpUser,
+    smtpPassword: config.smtpPassword,
+    sameSmtpCredentials: config.smtpUser === config.imapUser && config.smtpPassword === config.password,
+  };
+}
+
+function selectedScopesForForm(form: URLSearchParams, stored: StoredAuthState): string[] {
+  const requested = requestedScopes(stored.request);
+  const values = form.get("scope_form") === "1"
+    ? form.getAll("scope")
+    : stored.grantedScopes ?? requested;
+  return requested.filter((scope) => values.includes(scope));
+}
+
+function stateCookieFor(request: Request, state: string, secret: string): Promise<string> {
+  return signState(state, secret).then((signature) => stateCookie(request, state, signature));
+}
+
+function isVerificationError(error: unknown): boolean {
+  return error instanceof MailCredentialError || error instanceof AccountVaultError || error instanceof z.ZodError;
+}
+
+function verificationFailureMessage(mode: WizardMode, target: AccountFormTarget): string {
+  if (mode === "manage" && target === "start") return "The account profile could not be unlocked. Check the account details and try again.";
+  return "The account could not be verified. Check the account details and try again.";
+}
+
 async function beginCredentialAuthorization(request: Request, env: OAuthEnv): Promise<Response> {
   let oauthRequest: AuthRequest;
   try {
@@ -354,25 +679,22 @@ async function beginCredentialAuthorization(request: Request, env: OAuthEnv): Pr
     return errorRedirect(oauthRequest, "invalid_request", "PKCE S256 is required");
   }
   if (!resourceScopes(requestedScopes(oauthRequest)).length) {
-    return errorRedirect(oauthRequest, "invalid_scope", "Request at least one supported iCloud permission");
+    return errorRedirect(oauthRequest, "invalid_scope", "Request at least one supported Email MCP permission");
   }
 
   assertCredentialConfiguration(env);
   const secret = getCredentialsEncryptionSecret(env);
   const state = randomToken(32);
-  const signature = await signState(state, secret);
   const stored: StoredAuthState = {
     request: oauthRequest,
     clientName: client.clientName?.slice(0, 256) || "MCP client",
     attempts: 0,
   };
-  await env.OAUTH_KV.put(`${STATE_KEY_PREFIX}${state}`, JSON.stringify(stored), {
-    expirationTtl: AUTH_STATE_TTL_SECONDS,
-  });
-  return htmlResponse(renderLoginPage(state, stored), 200, stateCookie(request, state, signature));
+  await persistAuthState(env, state, stored);
+  return htmlResponse(renderStartPage(state, stored, requestedScopes(oauthRequest)), 200, await stateCookieFor(request, state, secret));
 }
 
-async function completeCredentialAuthorization(
+async function completeAuthorization(
   request: Request,
   env: OAuthEnv,
   dependencies: Required<CredentialAuthDependencies>,
@@ -380,7 +702,7 @@ async function completeCredentialAuthorization(
   assertCredentialConfiguration(env);
   const form = await readForm(request);
   const stateToken = form.get("authorization_state")?.trim() ?? "";
-  if (!stateToken || !/^[A-Za-z0-9_-]{32,128}$/u.test(stateToken)) return jsonError("Invalid authorization state", 400);
+  if (!STATE_TOKEN_PATTERN.test(stateToken)) return jsonError("Invalid authorization state", 400);
 
   const secret = getCredentialsEncryptionSecret(env);
   const cookie = cookieValue(request, stateCookieName(stateToken));
@@ -391,10 +713,13 @@ async function completeCredentialAuthorization(
   }
 
   const stored = asStoredState(await env.OAUTH_KV.get(`${STATE_KEY_PREFIX}${stateToken}`, "json"));
-  if (!stored) return jsonError("Expired authorization state", 400);
+  if (!stored) {
+    await deleteAccountDraft(env, stateToken);
+    return jsonError("Expired authorization state", 400);
+  }
 
-  if (form.get("decision") !== "approve") {
-    await env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${stateToken}`);
+  if (form.get("decision") === "deny") {
+    await deleteWizardState(env, stateToken);
     const denial = errorRedirect(stored.request, "access_denied", "Authorization was denied");
     return redirectWithCookie(
       denial.headers.get("Location") ?? stored.request.redirectUri,
@@ -402,62 +727,207 @@ async function completeCredentialAuthorization(
     );
   }
 
-  const selectedScopes = new Set(form.getAll("scope"));
-  const grantedScopes = requestedScopes(stored.request).filter((scope) => selectedScopes.has(scope));
-  const grantedResourceScopes = resourceScopes(grantedScopes);
+  const selectedScopes = selectedScopesForForm(form, stored);
+  const grantedResourceScopes = resourceScopes(selectedScopes);
   if (!grantedResourceScopes.length) {
     return htmlResponse(
-      renderLoginPage(stateToken, stored, "Select at least one iCloud permission.", form.get("icloud_email") ?? ""),
+      renderStartPage(stateToken, stored, selectedScopes, "Select at least one requested permission.", form),
       400,
-      stateCookie(request, stateToken, cookieSignature),
+      await stateCookieFor(request, stateToken, secret),
     );
   }
 
-  const email = form.get("icloud_email") ?? "";
-  const appPassword = form.get("icloud_app_password") ?? "";
-  let credentials: MailCredentials;
+  const action = form.get("action") ?? "verify";
+  const mode = form.get("mode") === "manage" || stored.mode === "manage" ? "manage" : "create";
+  const targetValue = form.get("target");
+  const target: AccountFormTarget = targetValue === "add" || targetValue === "edit" ? targetValue : "start";
+  const stateWithSelection: StoredAuthState = { ...stored, grantedScopes: selectedScopes, mode };
+
+  if (action === "add" || action === "edit") {
+    const draft = await loadAccountDraft(env, stateToken);
+    if (!draft) return jsonError("Expired authorization state", 400);
+    const existing = action === "edit" ? draft.accounts.find((account) => account.accountId === (form.get("account_id") ?? "")) : undefined;
+    const nextState = { ...stateWithSelection, mode: "manage" as const };
+    await persistAuthState(env, stateToken, nextState);
+    return htmlResponse(
+      renderAccountFormPage(stateToken, nextState, draft, action, selectedScopes, undefined, undefined, existing),
+      200,
+      await stateCookieFor(request, stateToken, secret),
+    );
+  }
+
+  if (action === "list") {
+    const draft = await loadAccountDraft(env, stateToken);
+    if (!draft) return jsonError("Expired authorization state", 400);
+    await persistAuthState(env, stateToken, stateWithSelection);
+    return htmlResponse(
+      renderManagementPage(stateToken, stateWithSelection, draft, selectedScopes),
+      200,
+      await stateCookieFor(request, stateToken, secret),
+    );
+  }
+
+  if (action === "remove" || action === "set_default" || action === "test" || action === "continue") {
+    const draft = await loadAccountDraft(env, stateToken);
+    if (!draft) return jsonError("Expired authorization state", 400);
+    const accountId = form.get("account_id") ?? "";
+    const account = draft.accounts.find((candidate) => candidate.accountId === accountId);
+    try {
+      if (action === "remove") {
+        const nextDraft = removeDraftAccount(draft, accountId);
+        await saveAccountDraft(env, stateToken, nextDraft);
+        await persistAuthState(env, stateToken, stateWithSelection);
+        return htmlResponse(
+          renderManagementPage(stateToken, stateWithSelection, nextDraft, selectedScopes, "The account was removed from this draft."),
+          200,
+          await stateCookieFor(request, stateToken, secret),
+        );
+      }
+      if (action === "set_default") {
+        const nextDraft = setDraftDefault(draft, accountId);
+        await saveAccountDraft(env, stateToken, nextDraft);
+        await persistAuthState(env, stateToken, stateWithSelection);
+        return htmlResponse(
+          renderManagementPage(stateToken, stateWithSelection, nextDraft, selectedScopes, "The default account was updated in this draft."),
+          200,
+          await stateCookieFor(request, stateToken, secret),
+        );
+      }
+      if (action === "test") {
+        if (!account) throw new AccountVaultError("Unknown accountId");
+        try {
+          await dependencies.verifyAccountSubmission(env, accountSubmissionFromStored(account), {}, account.accountId);
+        } catch (error) {
+          if (!isVerificationError(error)) throw error;
+          const attempts = stored.attempts + 1;
+          if (attempts >= MAX_AUTH_ATTEMPTS) {
+            await deleteWizardState(env, stateToken);
+            const response = jsonError("Account verification failed too many times", 401);
+            response.headers.set("Set-Cookie", clearStateCookie(request, stateToken));
+            return response;
+          }
+          const nextState = { ...stateWithSelection, attempts };
+          await persistAuthState(env, stateToken, nextState);
+          return htmlResponse(
+            renderManagementPage(stateToken, nextState, draft, selectedScopes, "The account could not be verified. Check its credentials and try again."),
+            401,
+            await stateCookieFor(request, stateToken, secret),
+          );
+        }
+        await persistAuthState(env, stateToken, stateWithSelection);
+        return htmlResponse(
+          renderManagementPage(stateToken, stateWithSelection, draft, selectedScopes, "The account connection was verified."),
+          200,
+          await stateCookieFor(request, stateToken, secret),
+        );
+      }
+      const committed = await commitAccountDraft(env, draft);
+      try {
+        const result = await env.OAUTH_PROVIDER.completeAuthorization({
+          request: stored.request,
+          userId: committed.userId,
+          metadata: { clientName: stored.clientName },
+          scope: selectedScopes,
+          props: { userId: committed.userId, scopes: grantedResourceScopes },
+        });
+        return redirectWithCookie(result.redirectTo, clearStateCookie(request, stateToken));
+      } finally {
+        await deleteWizardState(env, stateToken);
+      }
+    } catch (error) {
+      if (error instanceof AccountVaultError) {
+        return htmlResponse(
+          renderManagementPage(stateToken, stateWithSelection, draft, selectedScopes, error.message),
+          409,
+          await stateCookieFor(request, stateToken, secret),
+        );
+      }
+      throw error;
+    }
+  }
+
+  const submission = accountSubmissionFromForm(form);
+  let verifiedAccount: StoredMailAccount;
   try {
-    credentials = await dependencies.verifyCredentials(env, { email, appPassword }, grantedResourceScopes);
+    const existingId = target === "edit" ? form.get("account_id") ?? undefined : undefined;
+    verifiedAccount = await dependencies.verifyAccountSubmission(env, submission, {}, existingId);
   } catch (error) {
-    if (!(error instanceof MailCredentialError)) throw error;
+    if (!isVerificationError(error)) throw error;
     const attempts = stored.attempts + 1;
     if (attempts >= MAX_AUTH_ATTEMPTS) {
-      await env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${stateToken}`);
-      const response = jsonError("iCloud credential verification failed too many times", 401);
+      await deleteWizardState(env, stateToken);
+      const response = jsonError("Account verification failed too many times", 401);
       response.headers.set("Set-Cookie", clearStateCookie(request, stateToken));
       return response;
     }
-    const nextState = { ...stored, attempts };
-    await env.OAUTH_KV.put(`${STATE_KEY_PREFIX}${stateToken}`, JSON.stringify(nextState), {
-      expirationTtl: AUTH_STATE_TTL_SECONDS,
-    });
+    const nextState: StoredAuthState = { ...stateWithSelection, attempts };
+    await persistAuthState(env, stateToken, nextState);
+    if (target === "add" || target === "edit") {
+      const draft = await loadAccountDraft(env, stateToken);
+      if (!draft) return jsonError("Expired authorization state", 400);
+      const existing = target === "edit" ? draft.accounts.find((account) => account.accountId === (form.get("account_id") ?? "")) : undefined;
+      return htmlResponse(
+        renderAccountFormPage(stateToken, nextState, draft, target, selectedScopes, verificationFailureMessage(mode, target), form, existing),
+        401,
+        await stateCookieFor(request, stateToken, secret),
+      );
+    }
     return htmlResponse(
-      renderLoginPage(
-        stateToken,
-        nextState,
-        "The iCloud credentials could not be verified. Check the email and app-specific password.",
-        email,
-      ),
+      renderStartPage(stateToken, nextState, selectedScopes, verificationFailureMessage(mode, target), form),
       401,
-      stateCookie(request, stateToken, cookieSignature),
+      await stateCookieFor(request, stateToken, secret),
     );
   }
 
-  const credentialId = await dependencies.storeCredentials(env, credentials);
-  const props = {
-    userId: credentialId,
-    credentialId,
-    scopes: grantedResourceScopes,
-  };
-  const result = await env.OAUTH_PROVIDER.completeAuthorization({
-    request: stored.request,
-    userId: credentialId,
-    metadata: { clientName: stored.clientName },
-    scope: grantedScopes,
-    props,
-  });
-  await env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${stateToken}`);
-  return redirectWithCookie(result.redirectTo, clearStateCookie(request, stateToken));
+  let draft: AccountDraft;
+  try {
+    if (target === "start" && mode === "manage") {
+      draft = await unlockAccountDraft(env, verifiedAccount);
+    } else if (target === "start") {
+      draft = newAccountDraft(verifiedAccount);
+    } else {
+      const existingDraft = await loadAccountDraft(env, stateToken);
+      if (!existingDraft) return jsonError("Expired authorization state", 400);
+      draft = target === "add"
+        ? addDraftAccount(existingDraft, verifiedAccount)
+        : replaceDraftAccount(existingDraft, verifiedAccount);
+    }
+  } catch (error) {
+    if (!(error instanceof AccountVaultError)) throw error;
+    const attempts = target === "start" ? stored.attempts + 1 : stored.attempts;
+    if (attempts >= MAX_AUTH_ATTEMPTS) {
+      await deleteWizardState(env, stateToken);
+      const response = jsonError("Account verification failed too many times", 401);
+      response.headers.set("Set-Cookie", clearStateCookie(request, stateToken));
+      return response;
+    }
+    const nextState: StoredAuthState = { ...stateWithSelection, mode, attempts };
+    await persistAuthState(env, stateToken, nextState);
+    if (target === "start") {
+      return htmlResponse(
+        renderStartPage(stateToken, nextState, selectedScopes, "The account profile could not be unlocked. Check the account details and try again.", form),
+        401,
+        await stateCookieFor(request, stateToken, secret),
+      );
+    }
+    const existingDraft = await loadAccountDraft(env, stateToken);
+    if (!existingDraft) return jsonError("Expired authorization state", 400);
+    const existing = target === "edit" ? existingDraft.accounts.find((account) => account.accountId === (form.get("account_id") ?? "")) : undefined;
+    return htmlResponse(
+      renderAccountFormPage(stateToken, nextState, existingDraft, target, selectedScopes, "The account could not be added to this profile.", form, existing),
+      409,
+      await stateCookieFor(request, stateToken, secret),
+    );
+  }
+
+  await saveAccountDraft(env, stateToken, draft);
+  const nextState: StoredAuthState = { ...stateWithSelection, mode: "manage" };
+  await persistAuthState(env, stateToken, nextState);
+  return htmlResponse(
+    renderManagementPage(stateToken, nextState, draft, selectedScopes, target === "start" ? "The account was verified. Review the profile, then Continue." : "The account changes were saved to this draft."),
+    200,
+    await stateCookieFor(request, stateToken, secret),
+  );
 }
 
 function isCredentialConfigurationError(error: unknown): boolean {
@@ -470,8 +940,7 @@ function isCredentialConfigurationError(error: unknown): boolean {
 
 export function createCredentialAuthHandler(dependencies: CredentialAuthDependencies = {}): ExportedHandler<OAuthEnv> {
   const resolved: Required<CredentialAuthDependencies> = {
-    verifyCredentials: dependencies.verifyCredentials ?? ((env, input, scopes) => verifyMailCredentials(env, input, scopes)),
-    storeCredentials: dependencies.storeCredentials ?? storeMailCredentials,
+    verifyAccountSubmission: dependencies.verifyAccountSubmission ?? verifyAccountSubmission,
   };
   return {
     async fetch(request, env) {
@@ -479,11 +948,11 @@ export function createCredentialAuthHandler(dependencies: CredentialAuthDependen
       try {
         if (url.pathname === "/authorize") {
           if (request.method === "GET") return await beginCredentialAuthorization(request, env);
-          if (request.method === "POST") return await completeCredentialAuthorization(request, env, resolved);
+          if (request.method === "POST") return await completeAuthorization(request, env, resolved);
           return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
         }
         if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) {
-          return Response.json({ name: "icloud-mail-mcp", endpoint: "/mcp", status: "ok" });
+          return Response.json({ name: "email-mcp", endpoint: "/mcp", status: "ok" });
         }
         return new Response("Not found", { status: 404 });
       } catch (error) {

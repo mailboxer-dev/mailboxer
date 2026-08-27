@@ -45,6 +45,6 @@ export default new OAuthProvider<AppEnv>({
   resourceMetadata: {
     scopes_supported: [...RESOURCE_SCOPES],
     bearer_methods_supported: ["header"],
-    resource_name: "iCloud Mail, Calendar, and Contacts MCP server",
+    resource_name: "Email MCP server with multi-account Mail, Calendar, and Contacts access",
   },
 });

@@ -1,3 +1,4 @@
+import { AccountVaultError } from "./accounts";
 import { MailCredentialError } from "./credentials";
 import { DavPayloadTooLargeError, DavProtocolError } from "./dav/client";
 import { DavCursorError } from "./dav/cursor";
@@ -21,14 +22,15 @@ export function publicError(error: unknown): string {
   if (error instanceof ImapProtocolError || error instanceof SmtpProtocolError || error instanceof DavProtocolError) return error.message;
   if (error instanceof IcalendarParseError || error instanceof VcardParseError || error instanceof DavCursorError) return error.message;
   if (error instanceof MailCredentialError) return error.message;
-  if (error instanceof Error && error.message.startsWith("Missing Worker")) return "iCloud credentials are not configured";
+  if (error instanceof AccountVaultError) return error.message;
+  if (error instanceof Error && error.message.startsWith("Missing Worker")) return "Account credentials are not configured";
   if (error instanceof Error && error.message.startsWith("Missing required scope:")) return error.message;
   if (error instanceof z.ZodError) return "Input failed validation";
-  return "iCloud resource operation failed";
+  return "Email account operation failed";
 }
 
 export function requireScope(props: AuthProps, scope: ResourceScope): void {
-  if (!props?.userId || props.userId !== props.credentialId || !props.credentialId || !props.scopes.includes(scope)) {
+  if (!props?.userId || !props.scopes.includes(scope)) {
     throw new Error(`Missing required scope: ${scope}`);
   }
 }

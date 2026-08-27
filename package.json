@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A stateless Cloudflare Workers MCP server for iCloud Mail, Calendar, and Contacts over IMAP, SMTP, CalDAV, and CardDAV.",
+  "description": "A stateless multi-account Email MCP server on Cloudflare Workers with an iCloud preset and custom IMAP/SMTP support.",
   "scripts": {
     "dev": "wrangler dev",
     "start": "wrangler dev",
@@ -21,10 +21,10 @@
         "description": "Automatically provision a KV namespace for OAuth clients, authorization state, grants, access tokens, and refresh tokens. It must not contain mail content."
       },
       "MAIL_CREDENTIALS_KV": {
-        "description": "Automatically provision a KV namespace for encrypted per-user iCloud credentials."
+        "description": "Automatically provision a KV namespace for encrypted per-user account vaults and short-lived reconnect drafts."
       },
       "MAIL_CREDENTIALS_ENCRYPTION_KEY": {
-        "description": "Encryption key for per-user iCloud credentials. Generate with `openssl rand -hex 32`; do not reuse your iCloud password."
+        "description": "Encryption key for per-user account vaults. Generate with `openssl rand -hex 32`; do not reuse an email password."
       }
     }
   },

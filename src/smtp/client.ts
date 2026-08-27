@@ -13,6 +13,14 @@ import { protocolCommandName, withSpan } from "../tracing";
 
 const SMTP_TIMEOUT_MS = 30_000;
 
+type SmtpTlsMode = "implicit" | "starttls";
+
+type SmtpTransportConfig = MailConfig & {
+  smtpTlsMode?: SmtpTlsMode;
+  smtpUser?: string;
+  smtpPassword?: string;
+};
+
 export const SMTP_SOCKET_OPTIONS = {
   secureTransport: "starttls",
   allowHalfOpen: false,
@@ -20,10 +28,38 @@ export const SMTP_SOCKET_OPTIONS = {
 
 export type SmtpConnector = (config: MailConfig) => Promise<SocketLike>;
 
+function smtpTlsMode(config: MailConfig): SmtpTlsMode {
+  const configured = (config as SmtpTransportConfig).smtpTlsMode;
+  if (configured === "implicit" || configured === "starttls") return configured;
+  if (configured !== undefined) throw new SmtpProtocolError("Unsupported SMTP TLS mode");
+  return config.smtpPort === 465 ? "implicit" : "starttls";
+}
+
+function validateSmtpTransport(config: MailConfig, mode: SmtpTlsMode): void {
+  if (mode === "implicit" && config.smtpPort !== 465) {
+    throw new SmtpProtocolError("SMTP implicit TLS requires port 465");
+  }
+  if (mode === "starttls" && config.smtpPort !== 587 && config.smtpPort !== 2525) {
+    throw new SmtpProtocolError("SMTP STARTTLS requires port 587 or 2525");
+  }
+}
+
+export function smtpSocketOptions(config: MailConfig): {
+  secureTransport: "on" | "starttls";
+  allowHalfOpen: false;
+} {
+  const mode = smtpTlsMode(config);
+  validateSmtpTransport(config, mode);
+  return {
+    secureTransport: mode === "implicit" ? "on" : "starttls",
+    allowHalfOpen: false,
+  };
+}
+
 async function defaultConnector(config: MailConfig): Promise<SocketLike> {
   const socket = connect(
     { hostname: config.smtpHost, port: config.smtpPort },
-    SMTP_SOCKET_OPTIONS,
+    smtpSocketOptions(config),
   );
   if (socket.opened) await socket.opened;
   return socket;
@@ -48,10 +84,19 @@ export class SmtpProtocolError extends Error {
   }
 }
 
+function smtpCredentials(config: MailConfig): { user: string; password: string } {
+  const transportConfig = config as SmtpTransportConfig;
+  return {
+    user: transportConfig.smtpUser ?? config.email,
+    password: transportConfig.smtpPassword ?? config.password,
+  };
+}
+
 export class SmtpClient {
   private readonly connection: SocketConnection;
   private readonly config: MailConfig;
   private capabilities = new Set<string>();
+  private authMechanisms = new Set<string>();
   private authenticated = false;
 
   private constructor(connection: SocketConnection, config: MailConfig) {
@@ -63,10 +108,11 @@ export class SmtpClient {
     return withSpan(
       "mail.smtp.open",
       {
-        "server.address": config.smtpHost,
         "server.port": config.smtpPort,
+        "mail.smtp.tls_mode": smtpTlsMode(config),
       },
       async (span) => {
+        validateSmtpTransport(config, smtpTlsMode(config));
         const socket = await connector(config);
         const client = new SmtpClient(new SocketConnection(socket), config);
         try {
@@ -102,11 +148,11 @@ export class SmtpClient {
     if (reply.code !== expected) throw new SmtpProtocolError(`${operation} failed with SMTP ${reply.code}`);
   }
 
-  private async command(command: string, expected: number): Promise<SmtpReply> {
+  private async command(command: string, expected: number, safeName = protocolCommandName(command)): Promise<SmtpReply> {
     return withSpan(
       "mail.smtp.command",
       {
-        "mail.smtp.command_name": protocolCommandName(command),
+        "mail.smtp.command_name": safeName,
         "mail.smtp.expected_code": expected,
       },
       async (span) => {
@@ -115,26 +161,57 @@ export class SmtpClient {
         const reply = await this.readReply();
         span.setAttribute("mail.smtp.response_code", reply.code);
         span.setAttribute("mail.smtp.response_line_count", reply.lines.length);
-        this.expect(reply, expected, command.split(" ")[0]);
+        this.expect(reply, expected, safeName);
         return reply;
       },
     );
   }
 
   private async ehlo(): Promise<Set<string>> {
-    const reply = await this.command("EHLO icloud-mail-mcp.invalid", 250);
-    return new Set(reply.lines.map((line) => line.trim().split(/\s+/u)[0].toUpperCase()));
+    const reply = await this.command("EHLO email-mcp.invalid", 250);
+    const capabilities = new Set<string>();
+    const authMechanisms = new Set<string>();
+    for (const line of reply.lines) {
+      const tokens = line.trim().split(/\s+/u).filter(Boolean);
+      const first = tokens[0]?.toUpperCase();
+      if (!first) continue;
+      const authMatch = line.trim().match(/^AUTH(?:=|\s+)(.+)$/iu);
+      if (authMatch) {
+        for (const mechanism of authMatch[1].split(/\s+/u)) {
+          if (mechanism) authMechanisms.add(mechanism.toUpperCase());
+        }
+        capabilities.add("AUTH");
+      } else {
+        capabilities.add(first);
+      }
+    }
+    this.authMechanisms = authMechanisms;
+    return capabilities;
   }
 
   async authenticate(): Promise<void> {
     if (this.authenticated) return;
     return withSpan("mail.smtp.authenticate", {}, async (span) => {
-      if (!this.capabilities.has("STARTTLS")) throw new SmtpProtocolError("SMTP server does not advertise STARTTLS");
-      await this.command("STARTTLS", 220);
-      await this.connection.startTls();
-      this.capabilities = await this.ehlo();
-      const auth = base64Encode(`\u0000${this.config.email}\u0000${this.config.password}`);
-      await this.command(`AUTH PLAIN ${auth}`, 235);
+      if (smtpTlsMode(this.config) === "starttls") {
+        if (!this.capabilities.has("STARTTLS")) {
+          throw new SmtpProtocolError("SMTP server does not advertise STARTTLS");
+        }
+        await this.command("STARTTLS", 220);
+        await this.connection.startTls();
+        this.capabilities = await this.ehlo();
+      }
+
+      const credentials = smtpCredentials(this.config);
+      if (this.authMechanisms.has("PLAIN")) {
+        const auth = base64Encode(`\u0000${credentials.user}\u0000${credentials.password}`);
+        await this.command(`AUTH PLAIN ${auth}`, 235);
+      } else if (this.authMechanisms.has("LOGIN")) {
+        await this.command("AUTH LOGIN", 334);
+        await this.command(base64Encode(credentials.user), 334, "AUTH LOGIN");
+        await this.command(base64Encode(credentials.password), 235, "AUTH LOGIN");
+      } else {
+        throw new SmtpProtocolError("SMTP server does not advertise AUTH PLAIN or AUTH LOGIN");
+      }
       this.authenticated = true;
       span.setAttribute("mail.smtp.authenticated", true);
     });

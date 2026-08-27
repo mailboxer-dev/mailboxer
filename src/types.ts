@@ -14,7 +14,8 @@ export type ResourceScope = (typeof RESOURCE_SCOPES)[number];
 
 export interface AuthProps {
   userId: string;
-  credentialId: string;
+  /** Present on grants created before multi-account vaults were introduced. */
+  credentialId?: string;
   scopes: string[];
 }
 
@@ -23,9 +24,9 @@ export type MailAuthProps = AuthProps;
 export function restrictPropsToTokenScope(props: unknown, scopes: string[]): AuthProps {
   const record = props && typeof props === "object" ? props as Record<string, unknown> : {};
   const userId = typeof record.userId === "string" ? record.userId : "";
-  const credentialId = typeof record.credentialId === "string" ? record.credentialId : "";
+  const credentialId = typeof record.credentialId === "string" ? record.credentialId : undefined;
   const resourceScopes = scopes.filter((scope) => (RESOURCE_SCOPES as readonly string[]).includes(scope));
-  return { userId, credentialId, scopes: resourceScopes };
+  return { userId, ...(credentialId ? { credentialId } : {}), scopes: resourceScopes };
 }
 
 export const restrictMailPropsToTokenScope = restrictPropsToTokenScope;
@@ -44,8 +45,47 @@ export interface MailConfig {
   password: string;
   imapHost: string;
   imapPort: number;
+  imapTlsMode: "implicit" | "starttls";
   smtpHost: string;
   smtpPort: number;
+  smtpTlsMode: "implicit" | "starttls";
+  smtpUser: string;
+  smtpPassword: string;
+}
+
+export type AccountPreset = "icloud" | "custom";
+export type AccountCapability = "mail" | "calendar" | "contacts";
+
+export interface AccountCapabilities {
+  mail: boolean;
+  calendar: boolean;
+  contacts: boolean;
+}
+
+export interface AccountSummary {
+  accountId: string;
+  label: string;
+  address: string;
+  preset: AccountPreset;
+  capabilities: AccountCapabilities;
+  isDefault: boolean;
+}
+
+export interface StoredMailAccount {
+  accountId: string;
+  label: string;
+  preset: AccountPreset;
+  address: string;
+  capabilities: AccountCapabilities;
+  config: MailConfig;
+}
+
+export interface AccountVaultV2 {
+  version: 2;
+  userId: string;
+  revision: number;
+  defaultAccountId: string;
+  accounts: StoredMailAccount[];
 }
 
 export interface DavConfig {

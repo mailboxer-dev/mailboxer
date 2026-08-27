@@ -42,10 +42,44 @@ export interface ImapResponse {
 
 export type ImapConnector = (config: MailConfig) => Promise<SocketLike>;
 
+type ImapTlsMode = "implicit" | "starttls";
+
+type ImapTransportConfig = MailConfig & {
+  imapTlsMode?: ImapTlsMode;
+};
+
+function imapTlsMode(config: MailConfig): ImapTlsMode {
+  const configured = (config as ImapTransportConfig).imapTlsMode;
+  if (configured === "implicit" || configured === "starttls") return configured;
+  if (configured !== undefined) throw new ImapProtocolError("Unsupported IMAP TLS mode");
+  return config.imapPort === 143 ? "starttls" : "implicit";
+}
+
+function validateImapTransport(config: MailConfig, mode: ImapTlsMode): void {
+  if (mode === "implicit" && config.imapPort !== 993) {
+    throw new ImapProtocolError("IMAP implicit TLS requires port 993");
+  }
+  if (mode === "starttls" && config.imapPort !== 143) {
+    throw new ImapProtocolError("IMAP STARTTLS requires port 143");
+  }
+}
+
+export function imapSocketOptions(config: MailConfig): {
+  secureTransport: "on" | "starttls";
+  allowHalfOpen: false;
+} {
+  const mode = imapTlsMode(config);
+  validateImapTransport(config, mode);
+  return {
+    secureTransport: mode === "implicit" ? "on" : "starttls",
+    allowHalfOpen: false,
+  };
+}
+
 async function defaultConnector(config: MailConfig): Promise<SocketLike> {
   const socket = connect(
     { hostname: config.imapHost, port: config.imapPort },
-    { secureTransport: "on", allowHalfOpen: false },
+    imapSocketOptions(config),
   );
   if (socket.opened) await socket.opened;
   return socket;
@@ -89,10 +123,11 @@ export class ImapClient {
     return withSpan(
       "mail.imap.open",
       {
-        "server.address": config.imapHost,
         "server.port": config.imapPort,
+        "mail.imap.tls_mode": imapTlsMode(config),
       },
       async (span) => {
+        validateImapTransport(config, imapTlsMode(config));
         const socket = await connector(config);
         const client = new ImapClient(new SocketConnection(socket), config);
         try {
@@ -115,13 +150,32 @@ export class ImapClient {
   private async initialize(): Promise<void> {
     const greeting = await withTimeout(this.connection.readLine(), IMAP_TIMEOUT_MS, "IMAP greeting");
     if (!/^\*\s+(?:OK|PREAUTH)\b/iu.test(greeting)) {
-      throw new ImapProtocolError("iCloud IMAP server did not provide an OK greeting");
+      throw new ImapProtocolError("IMAP server did not provide an OK greeting");
     }
-    if (!/^\*\s+PREAUTH\b/iu.test(greeting)) {
+
+    const preAuthenticated = /^\*\s+PREAUTH\b/iu.test(greeting);
+    if (imapTlsMode(this.config) === "starttls") {
+      const beforeTls = await this.command("CAPABILITY");
+      this.capabilities = capabilityTokens(beforeTls.lines);
+      if (!this.supports("STARTTLS")) {
+        throw new ImapProtocolError("IMAP server does not advertise STARTTLS");
+      }
+      await this.command("STARTTLS");
+      await this.connection.startTls();
+
+      // RFC 2595 requires capabilities to be refreshed after STARTTLS.
+      const afterTls = await this.command("CAPABILITY");
+      this.capabilities = capabilityTokens(afterTls.lines);
+    }
+
+    if (!preAuthenticated) {
       await this.command(`LOGIN ${quoteImapString(this.config.imapUser)} ${quoteImapString(this.config.password)}`);
     }
-    const response = await this.command("CAPABILITY");
-    this.capabilities = capabilityTokens(response.lines);
+
+    if (imapTlsMode(this.config) === "implicit") {
+      const response = await this.command("CAPABILITY");
+      this.capabilities = capabilityTokens(response.lines);
+    }
   }
 
   private async readResponse(tag: string, maxLiteralBytes: number): Promise<ImapResponse> {

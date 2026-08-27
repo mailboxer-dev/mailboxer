@@ -1,20 +1,14 @@
+import type { AuthRequest, CompleteAuthorizationOptions, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { describe, expect, it, vi } from "vitest";
-import type {
-  AuthRequest,
-  CompleteAuthorizationOptions,
-  OAuthHelpers,
-} from "@cloudflare/workers-oauth-provider";
-import {
-  createCredentialAuthHandler,
-  type CredentialAuthDependencies,
-} from "../src/auth";
+import { commitAccountDraft, newAccountDraft } from "../src/accounts";
+import { createCredentialAuthHandler, type CredentialAuthDependencies } from "../src/auth";
 import { MailCredentialError } from "../src/credentials";
-import { restrictMailPropsToTokenScope, type AppEnv, type MailCredentials } from "../src/types";
+import { restrictMailPropsToTokenScope, type AppEnv, type StoredMailAccount } from "../src/types";
 
 class MemoryKv {
-  private readonly values = new Map<string, string>();
+  readonly values = new Map<string, string>();
 
-  async put(key: string, value: string, _options?: unknown): Promise<void> {
+  async put(key: string, value: string): Promise<void> {
     this.values.set(key, value);
   }
 
@@ -26,10 +20,6 @@ class MemoryKv {
 
   async delete(key: string): Promise<void> {
     this.values.delete(key);
-  }
-
-  keys(): string[] {
-    return [...this.values.keys()];
   }
 }
 
@@ -45,11 +35,35 @@ function oauthRequest(): AuthRequest {
   };
 }
 
-function oauthEnv(
-  kv: MemoryKv,
-  completeAuthorization?: OAuthHelpers["completeAuthorization"],
-  encryptionKey = "a-secure-test-encryption-key-with-32-chars",
-): AppEnv {
+function account(seed = "primary"): StoredMailAccount {
+  return {
+    accountId: `acct_${seed.padEnd(22, "x").slice(0, 22)}`,
+    label: seed === "primary" ? "Personal" : "Second",
+    preset: "icloud",
+    address: `${seed}@icloud.com`,
+    capabilities: { mail: true, calendar: true, contacts: true },
+    config: {
+      email: `${seed}@icloud.com`,
+      imapUser: seed,
+      password: "app-password",
+      imapHost: "imap.mail.me.com",
+      imapPort: 993,
+      imapTlsMode: "implicit",
+      smtpHost: "smtp.mail.me.com",
+      smtpPort: 587,
+      smtpTlsMode: "starttls",
+      smtpUser: `${seed}@icloud.com`,
+      smtpPassword: "app-password",
+    },
+  };
+}
+
+function oauthEnv(options: {
+  oauthKv?: MemoryKv;
+  credentialsKv?: MemoryKv;
+  complete?: OAuthHelpers["completeAuthorization"];
+  encryptionKey?: string;
+} = {}): AppEnv {
   const request = oauthRequest();
   const helpers = {
     parseAuthRequest: async () => request,
@@ -59,19 +73,15 @@ function oauthEnv(
       tokenEndpointAuthMethod: "none",
       clientName: "Test <client>",
     }),
-    completeAuthorization: completeAuthorization ?? (async () => ({ redirectTo: "https://client.example/callback?code=local" })),
+    completeAuthorization: options.complete ?? (async () => ({ redirectTo: "https://client.example/callback?code=local" })),
   } as unknown as OAuthHelpers;
   return {
-    OAUTH_KV: kv as unknown as KVNamespace,
-    MAIL_CREDENTIALS_KV: new MemoryKv() as unknown as KVNamespace,
+    OAUTH_KV: (options.oauthKv ?? new MemoryKv()) as unknown as KVNamespace,
+    MAIL_CREDENTIALS_KV: (options.credentialsKv ?? new MemoryKv()) as unknown as KVNamespace,
     OAUTH_PROVIDER: helpers,
-    IMAP_HOST: "imap.mail.me.com",
-    IMAP_PORT: "993",
-    SMTP_HOST: "smtp.mail.me.com",
-    SMTP_PORT: "587",
     CALDAV_URL: "https://caldav.icloud.com/",
     CARDDAV_URL: "https://contacts.icloud.com/",
-    MAIL_CREDENTIALS_ENCRYPTION_KEY: encryptionKey,
+    MAIL_CREDENTIALS_ENCRYPTION_KEY: options.encryptionKey ?? "a-secure-test-encryption-key-with-32-chars",
   };
 }
 
@@ -83,10 +93,6 @@ function authFetchFor(dependencies?: CredentialAuthDependencies) {
   ) => Promise<Response>;
 }
 
-function context(): ExecutionContext {
-  return {} as unknown as ExecutionContext;
-}
-
 function stateAndCookie(response: Response): { state: string; cookie: string } {
   const setCookie = response.headers.get("Set-Cookie") ?? "";
   const cookie = setCookie.split(";", 1)[0];
@@ -96,181 +102,162 @@ function stateAndCookie(response: Response): { state: string; cookie: string } {
   return { state, cookie };
 }
 
-function authorizationForm(
-  state: string,
-  email = "owner@icloud.com",
-  appPassword = "app-password",
-  decision = "approve",
-  scopes = ["mail.read"],
-): Request {
-  const body = new URLSearchParams({
-    authorization_state: state,
-    icloud_email: email,
-    icloud_app_password: appPassword,
-    decision,
-  });
+function post(state: string, cookie: string | undefined, values: Record<string, string>, scopes = ["mail.read"]): Request {
+  const body = new URLSearchParams({ authorization_state: state, ...values });
+  if (!body.has("scope_form")) body.set("scope_form", "1");
   for (const scope of scopes) body.append("scope", scope);
   return new Request("https://mcp.example/authorize", {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      ...(cookie ? { Cookie: cookie } : {}),
+    },
     body,
   });
 }
 
-describe("iCloud credential OAuth authorization", () => {
-  it("restricts handler props to the scopes on each access token", () => {
+function initialAccountForm(state: string, cookie: string | undefined, mode: "create" | "manage" = "create"): Request {
+  return post(state, cookie, {
+    action: "verify",
+    target: "start",
+    mode,
+    preset: "icloud",
+    label: "Personal",
+    address: "primary@icloud.com",
+    app_password: "app-password",
+    service_options_present: "1",
+    enable_mail: "1",
+  });
+}
+
+const context = {} as ExecutionContext;
+
+describe("multi-account OAuth authorization", () => {
+  it("narrows v2 and legacy props to the access token scope", () => {
     expect(restrictMailPropsToTokenScope(
-      { userId: "icloud-test-id", credentialId: "icloud-test-id", scopes: ["mail.read", "mail.write"] },
+      { userId: "usr_test", scopes: ["mail.read", "mail.write"] },
       ["mail.read", "offline_access"],
-    )).toEqual({ userId: "icloud-test-id", credentialId: "icloud-test-id", scopes: ["mail.read"] });
+    )).toEqual({ userId: "usr_test", scopes: ["mail.read"] });
+    expect(restrictMailPropsToTokenScope(
+      { userId: "icloud-test", credentialId: "icloud-test", scopes: ["mail.read"] },
+      ["mail.read"],
+    )).toEqual({ userId: "icloud-test", credentialId: "icloud-test", scopes: ["mail.read"] });
   });
 
-  it("renders a credential form with a signed, one-time state and no password", async () => {
-    const kv = new MemoryKv();
-    const response = await authFetchFor()(new Request("https://mcp.example/authorize"), oauthEnv(kv), context());
+  it("renders a generic create/manage page with requested scopes and no credentials", async () => {
+    const oauthKv = new MemoryKv();
+    const response = await authFetchFor()(new Request("https://mcp.example/authorize"), oauthEnv({ oauthKv }), context);
     const body = await response.text();
-
     expect(response.status).toBe(200);
-    expect(body).toContain("Test &lt;client&gt;");
-    expect(body).toContain('name="icloud_email"');
-    expect(body).toContain('name="icloud_app_password"');
+    expect(body).toContain("Email MCP");
+    expect(body).toContain("Create a new profile");
+    expect(body).toContain("Manage an existing profile");
+    expect(body).toContain("mail.read");
+    expect(body).not.toContain("calendar.read");
     expect(body).not.toContain("app-password");
-    expect(body).not.toContain("MCP_LOGIN_SECRET");
     expect(response.headers.get("Set-Cookie")).toContain("HttpOnly");
     expect(response.headers.get("Set-Cookie")).toContain("Path=/authorize");
-    expect(response.headers.get("Set-Cookie")).toContain("SameSite=None");
-    expect(response.headers.get("Set-Cookie")).toContain("mcp_oauth_state_");
-    expect(body).toContain("calendar.read");
-    expect(body).toContain("contacts.read");
-    expect(kv.keys()).toHaveLength(1);
+    expect(oauthKv.values.size).toBe(1);
   });
 
-  it("rejects authorization POSTs without the bound state cookie", async () => {
-    const kv = new MemoryKv();
-    const response = await authFetchFor()(authorizationForm("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), oauthEnv(kv), context());
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: "Invalid authorization state" });
-  });
-
-  it("accepts a cookie-blocked same-origin form without weakening cross-site protection", async () => {
-    const kv = new MemoryKv();
-    const env = oauthEnv(kv);
-    const authFetch = authFetchFor({
-      verifyCredentials: vi.fn(async () => ({ email: "owner@icloud.com", imapUser: "owner", appPassword: "app-password" })),
-      storeCredentials: vi.fn(async () => "icloud-test-id"),
-    });
-    const authorize = await authFetch(new Request("https://mcp.example/authorize"), env, context());
+  it("rejects an unbound cross-site POST but accepts the same-origin cookie fallback", async () => {
+    const oauthKv = new MemoryKv();
+    const environment = oauthEnv({ oauthKv });
+    const verify = vi.fn(async () => account());
+    const authFetch = authFetchFor({ verifyAccountSubmission: verify });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state } = stateAndCookie(authorize);
-    const form = authorizationForm(state);
-    form.headers.set("Origin", "https://mcp.example");
-    await expect(authFetch(form, env, context())).resolves.toMatchObject({ status: 302 });
 
-    const secondAuthorize = await authFetch(new Request("https://mcp.example/authorize"), env, context());
-    const { state: secondState } = stateAndCookie(secondAuthorize);
-    const crossSite = authorizationForm(secondState);
+    const sameOrigin = initialAccountForm(state, undefined);
+    sameOrigin.headers.set("Origin", "https://mcp.example");
+    expect((await authFetch(sameOrigin, environment, context)).status).toBe(200);
+
+    const second = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
+    const secondState = stateAndCookie(second).state;
+    const crossSite = initialAccountForm(secondState, undefined);
     crossSite.headers.set("Origin", "https://attacker.example");
-    await expect(authFetch(crossSite, env, context())).resolves.toMatchObject({ status: 400 });
+    expect((await authFetch(crossSite, environment, context)).status).toBe(400);
   });
 
-  it("keeps concurrent authorization pages bound to their own state cookies", async () => {
-    const kv = new MemoryKv();
-    const env = oauthEnv(kv);
-    const authFetch = authFetchFor({
-      verifyCredentials: vi.fn(async () => ({ email: "owner@icloud.com", imapUser: "owner", appPassword: "app-password" })),
-      storeCredentials: vi.fn(async () => "icloud-test-id"),
-    });
-    const first = await authFetch(new Request("https://mcp.example/authorize"), env, context());
-    const second = await authFetch(new Request("https://mcp.example/authorize"), env, context());
-    const firstState = stateAndCookie(first);
-    const secondState = stateAndCookie(second);
-
-    const firstForm = authorizationForm(firstState.state);
-    firstForm.headers.set("Cookie", firstState.cookie);
-    const secondForm = authorizationForm(secondState.state);
-    secondForm.headers.set("Cookie", secondState.cookie);
-
-    await expect(authFetch(firstForm, env, context())).resolves.toMatchObject({ status: 302 });
-    await expect(authFetch(secondForm, env, context())).resolves.toMatchObject({ status: 302 });
-  });
-
-  it("does not issue a grant when iCloud credential verification fails", async () => {
-    const kv = new MemoryKv();
-    const verifyCredentials = vi.fn(async () => {
-      throw new MailCredentialError("invalid credentials");
-    });
-    const storeCredentials = vi.fn(async () => "icloud-test-id");
-    const env = oauthEnv(kv);
-    const authFetch = authFetchFor({ verifyCredentials, storeCredentials });
-    const authorize = await authFetch(new Request("https://mcp.example/authorize"), env, context());
-    const { state, cookie } = stateAndCookie(authorize);
-    const form = authorizationForm(state);
-    form.headers.set("Cookie", cookie);
-
-    const response = await authFetch(form, env, context());
-    expect(response.status).toBe(401);
-    expect(await response.text()).toContain("could not be verified");
-    expect(verifyCredentials).toHaveBeenCalledWith(env, { email: "owner@icloud.com", appPassword: "app-password" }, ["mail.read"]);
-    expect(storeCredentials).not.toHaveBeenCalled();
-    expect(kv.keys()).toHaveLength(1);
-  });
-
-  it("stores credentials separately and issues a PKCE authorization code with opaque props", async () => {
-    const kv = new MemoryKv();
+  it("creates an encrypted draft, commits it on Continue, and issues opaque v2 props", async () => {
+    const oauthKv = new MemoryKv();
+    const credentialsKv = new MemoryKv();
     const complete = vi.fn(async (_options: CompleteAuthorizationOptions) => ({ redirectTo: "https://client.example/callback?code=issued" }));
-    const credentials: MailCredentials = {
-      email: "owner@icloud.com",
-      imapUser: "owner",
-      appPassword: "app-password",
-    };
-    const verifyCredentials = vi.fn(async () => credentials);
-    const storeCredentials = vi.fn(async (_env: AppEnv, value: MailCredentials) => {
-      expect(value).toEqual(credentials);
-      return "icloud-test-id";
-    });
-    const env = oauthEnv(kv, complete);
-    const authFetch = authFetchFor({ verifyCredentials, storeCredentials });
-    const authorize = await authFetch(new Request("https://mcp.example/authorize"), env, context());
+    const environment = oauthEnv({ oauthKv, credentialsKv, complete });
+    const authFetch = authFetchFor({ verifyAccountSubmission: vi.fn(async () => account()) });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
-    const form = authorizationForm(state, "owner@icloud.com", "app-password", "approve", ["mail.read", "offline_access"]);
-    form.headers.set("Cookie", cookie);
 
-    const response = await authFetch(form, env, context());
+    const verified = await authFetch(initialAccountForm(state, cookie), environment, context);
+    expect(verified.status).toBe(200);
+    expect(await verified.text()).toContain("Review the profile");
+    expect([...credentialsKv.values.values()].join("\n")).not.toContain("app-password");
+
+    const response = await authFetch(post(state, cookie, { action: "continue", mode: "manage" }, ["mail.read", "offline_access"]), environment, context);
     expect(response.status).toBe(302);
-    expect(response.headers.get("Location")).toBe("https://client.example/callback?code=issued");
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Location")).toContain("code=issued");
     expect(response.headers.get("Set-Cookie")).toContain("Max-Age=0");
-    expect(kv.keys()).toHaveLength(0);
     expect(complete).toHaveBeenCalledOnce();
-
     const options = complete.mock.calls[0][0];
-    expect(options.userId).toBe("icloud-test-id");
+    expect(options.userId).toMatch(/^usr_/u);
     expect(options.scope).toEqual(["mail.read", "offline_access"]);
-    expect(options.props).toEqual({ userId: "icloud-test-id", credentialId: "icloud-test-id", scopes: ["mail.read"] });
-    expect(JSON.stringify(options.props)).not.toContain("owner@icloud.com");
-    expect(JSON.stringify(options.props)).not.toContain("app-password");
+    expect(options.props).toEqual({ userId: options.userId, scopes: ["mail.read"] });
+    expect(JSON.stringify(options.props)).not.toContain("icloud.com");
+    expect(oauthKv.values.size).toBe(0);
   });
 
-  it("returns an OAuth denial and consumes the state when the user cancels", async () => {
-    const kv = new MemoryKv();
-    const verifyCredentials = vi.fn(async () => ({ email: "owner@icloud.com", imapUser: "owner", appPassword: "app-password" }));
-    const env = oauthEnv(kv);
-    const authFetch = authFetchFor({ verifyCredentials });
-    const authorize = await authFetch(new Request("https://mcp.example/authorize"), env, context());
+  it("unlocks an existing profile by verifying any configured live account", async () => {
+    const oauthKv = new MemoryKv();
+    const credentialsKv = new MemoryKv();
+    const environment = oauthEnv({ oauthKv, credentialsKv });
+    const vault = await commitAccountDraft(environment, newAccountDraft(account()));
+    const verifiedAccount = { ...account(), accountId: "acct_zzzzzzzzzzzzzzzzzzzzzz" };
+    const authFetch = authFetchFor({ verifyAccountSubmission: vi.fn(async () => verifiedAccount) });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
-    const form = authorizationForm(state, "", "", "deny", []);
-    form.headers.set("Cookie", cookie);
-
-    const response = await authFetch(form, env, context());
-    expect(response.status).toBe(302);
-    expect(response.headers.get("Location")).toContain("error=access_denied");
-    expect(response.headers.get("Set-Cookie")).toContain("Max-Age=0");
-    expect(verifyCredentials).not.toHaveBeenCalled();
-    expect(kv.keys()).toHaveLength(0);
+    const response = await authFetch(initialAccountForm(state, cookie, "manage"), environment, context);
+    const body = await response.text();
+    expect(response.status).toBe(200);
+    expect(body).toContain("Personal");
+    expect(body).toContain("Manage Email MCP accounts");
+    expect(body).not.toContain(vault.userId);
   });
 
-  it("returns a configuration error instead of throwing when encryption is not configured", async () => {
-    const kv = new MemoryKv();
-    const response = await authFetchFor()(new Request("https://mcp.example/authorize"), oauthEnv(kv, undefined, "short"), context());
+  it("returns a generic verification error and enforces the five-attempt limit", async () => {
+    const environment = oauthEnv();
+    const authFetch = authFetchFor({
+      verifyAccountSubmission: vi.fn(async () => { throw new MailCredentialError("specific upstream failure"); }),
+    });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
+    const { state, cookie } = stateAndCookie(authorize);
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const response = await authFetch(initialAccountForm(state, cookie), environment, context);
+      expect(response.status).toBe(401);
+      expect(await response.text()).toContain("could not be verified");
+    }
+    const final = await authFetch(initialAccountForm(state, cookie), environment, context);
+    expect(final.status).toBe(401);
+    expect(await final.json()).toEqual({ error: "Account verification failed too many times" });
+    expect(final.headers.get("Set-Cookie")).toContain("Max-Age=0");
+  });
+
+  it("denies authorization and deletes OAuth state and account drafts", async () => {
+    const oauthKv = new MemoryKv();
+    const credentialsKv = new MemoryKv();
+    const environment = oauthEnv({ oauthKv, credentialsKv });
+    const authFetch = authFetchFor({ verifyAccountSubmission: vi.fn(async () => account()) });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
+    const { state, cookie } = stateAndCookie(authorize);
+    await authFetch(initialAccountForm(state, cookie), environment, context);
+    const denied = await authFetch(post(state, cookie, { decision: "deny", mode: "manage" }, []), environment, context);
+    expect(denied.status).toBe(302);
+    expect(denied.headers.get("Location")).toContain("error=access_denied");
+    expect(oauthKv.values.size).toBe(0);
+    expect([...credentialsKv.values.keys()].some((key) => key.includes("draft"))).toBe(false);
+  });
+
+  it("returns a configuration error when the encryption secret is invalid", async () => {
+    const response = await authFetchFor()(new Request("https://mcp.example/authorize"), oauthEnv({ encryptionKey: "short" }), context);
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({ error: "Mail credential storage is not configured" });
   });

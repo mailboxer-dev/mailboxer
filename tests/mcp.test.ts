@@ -1,6 +1,7 @@
 import { createMcpHandler } from "agents/mcp/server";
 import { describe, expect, it, vi } from "vitest";
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import { commitAccountDraft, newAccountDraft } from "../src/accounts";
 import { storeMailCredentials } from "../src/credentials";
 import { createMailServer, TOOL_NAMES } from "../src/mail-server";
 import type { AppEnv, MailAuthProps } from "../src/types";
@@ -17,6 +18,10 @@ class MemoryKv {
     if (value === undefined) return null;
     return type === "json" ? JSON.parse(value) as unknown : value;
   }
+
+  async delete(key: string): Promise<void> {
+    this.values.delete(key);
+  }
 }
 
 function testEnv(credentialsKv: KVNamespace = {} as KVNamespace): AppEnv {
@@ -24,10 +29,6 @@ function testEnv(credentialsKv: KVNamespace = {} as KVNamespace): AppEnv {
     OAUTH_KV: {} as KVNamespace,
     MAIL_CREDENTIALS_KV: credentialsKv,
     OAUTH_PROVIDER: {} as OAuthHelpers,
-    IMAP_HOST: "imap.mail.me.com",
-    IMAP_PORT: "993",
-    SMTP_HOST: "smtp.mail.me.com",
-    SMTP_PORT: "587",
     CALDAV_URL: "https://caldav.icloud.com/",
     CARDDAV_URL: "https://contacts.icloud.com/",
     MAIL_CREDENTIALS_ENCRYPTION_KEY: "a-secure-test-encryption-key-with-32-chars",
@@ -85,7 +86,7 @@ describe("stateless MCP handler", () => {
     expect(initialized.status).toBe(200);
     expect(initialized.headers.get("Mcp-Session-Id")).toBeNull();
     const initialization = await sseJson(initialized) as { result?: { serverInfo?: { name?: string } } };
-    expect(initialization.result?.serverInfo?.name).toBe("icloud-mail-mcp");
+    expect(initialization.result?.serverInfo?.name).toBe("email-mcp");
 
     const tools = await rpc(handler, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
     expect(tools.status).toBe(200);
@@ -103,6 +104,7 @@ describe("stateless MCP handler", () => {
       result?: { tools?: Array<{ name: string; annotations?: Record<string, unknown> }> };
     };
     const tools = listing.result?.tools ?? [];
+    expect(tools.find((tool) => tool.name === "list_accounts")?.annotations).toMatchObject({ readOnlyHint: true });
     expect(tools.find((tool) => tool.name === "list_calendars")?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
     expect(tools.find((tool) => tool.name === "create_calendar_item")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false });
     expect(tools.find((tool) => tool.name === "delete_contact")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
@@ -119,6 +121,55 @@ describe("stateless MCP handler", () => {
     })) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } };
     expect(denied.result?.isError).toBe(true);
     expect(denied.result?.content?.[0]?.text).toContain("Missing required scope: calendar.read");
+  });
+
+  it("advertises account selection on every resource tool and lists a v2 account vault", async () => {
+    const credentialsKv = new MemoryKv();
+    const environment = testEnv(credentialsKv as unknown as KVNamespace);
+    const configured = {
+      accountId: "acct_aaaaaaaaaaaaaaaaaaaaaa",
+      label: "Personal",
+      preset: "icloud" as const,
+      address: "owner@icloud.com",
+      capabilities: { mail: true, calendar: true, contacts: true },
+      config: {
+        email: "owner@icloud.com",
+        imapUser: "owner",
+        password: "app-password",
+        imapHost: "imap.mail.me.com",
+        imapPort: 993,
+        imapTlsMode: "implicit" as const,
+        smtpHost: "smtp.mail.me.com",
+        smtpPort: 587,
+        smtpTlsMode: "starttls" as const,
+        smtpUser: "owner@icloud.com",
+        smtpPassword: "app-password",
+      },
+    };
+    const vault = await commitAccountDraft(environment, newAccountDraft(configured));
+    const v2Props = { userId: vault.userId, scopes: ["mail.read", "calendar.read", "contacts.read"] };
+    const handler = createMcpHandler(
+      () => createMailServer(environment, v2Props),
+      { route: "/mcp", legacy: "stateless", authContext: { props: { ...v2Props } } },
+    );
+    const listing = await sseJson(await rpc(handler, { jsonrpc: "2.0", id: 20, method: "tools/list", params: {} }, environment)) as {
+      result?: { tools?: Array<{ name: string; inputSchema?: { properties?: Record<string, unknown> } }> };
+    };
+    for (const tool of listing.result?.tools ?? []) {
+      if (tool.name !== "list_accounts") expect(tool.inputSchema?.properties).toHaveProperty("accountId");
+    }
+
+    const response = await rpc(handler, {
+      jsonrpc: "2.0",
+      id: 21,
+      method: "tools/call",
+      params: { name: "list_accounts", arguments: {} },
+    }, environment);
+    const result = await sseJson(response) as { result?: { content?: Array<{ text?: string }> } };
+    const value = JSON.parse(result.result?.content?.[0]?.text ?? "{}") as { defaultAccountId?: string; accounts?: unknown[] };
+    expect(value.defaultAccountId).toBe(configured.accountId);
+    expect(value.accounts).toEqual([expect.objectContaining({ label: "Personal", isDefault: true })]);
+    expect(JSON.stringify(value)).not.toContain("app-password");
   });
 
   it("invokes a DAV tool through the stateless handler with the encrypted credential record", async () => {
