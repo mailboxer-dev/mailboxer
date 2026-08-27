@@ -112,16 +112,37 @@ function cookieValue(request: Request, name: string): string | null {
   return null;
 }
 
+function sameOriginFormSubmission(request: Request): boolean {
+  const origin = request.headers.get("Origin");
+  const requestOrigin = new URL(request.url).origin;
+  if (origin) return origin === requestOrigin;
+  const referer = request.headers.get("Referer");
+  if (!referer) return false;
+  try {
+    return new URL(referer).origin === requestOrigin;
+  } catch {
+    return false;
+  }
+}
+
 function secureCookieAttribute(request: Request): string {
   return new URL(request.url).protocol === "https:" ? "; Secure" : "";
 }
 
-function stateCookie(request: Request, state: string, signature: string): string {
-  return `${STATE_COOKIE_NAME}=${state}.${signature}; Max-Age=${AUTH_STATE_TTL_SECONDS}; Path=/authorize; HttpOnly; SameSite=Lax${secureCookieAttribute(request)}`;
+function stateCookieName(state: string): string {
+  return `${STATE_COOKIE_NAME}_${state}`;
 }
 
-function clearStateCookie(request: Request): string {
-  return `${STATE_COOKIE_NAME}=; Max-Age=0; Path=/authorize; HttpOnly; SameSite=Lax${secureCookieAttribute(request)}`;
+function sameSiteCookieAttribute(request: Request): string {
+  return new URL(request.url).protocol === "https:" ? "; SameSite=None" : "; SameSite=Lax";
+}
+
+function stateCookie(request: Request, state: string, signature: string): string {
+  return `${stateCookieName(state)}=${state}.${signature}; Max-Age=${AUTH_STATE_TTL_SECONDS}; Path=/authorize; HttpOnly${sameSiteCookieAttribute(request)}${secureCookieAttribute(request)}`;
+}
+
+function clearStateCookie(request: Request, state: string): string {
+  return `${stateCookieName(state)}=; Max-Age=0; Path=/authorize; HttpOnly${sameSiteCookieAttribute(request)}${secureCookieAttribute(request)}`;
 }
 
 function redirectWithCookie(url: string, cookie: string): Response {
@@ -200,12 +221,17 @@ function renderLoginPage(
   errorMessage?: string,
   emailValue = "",
 ): string {
-  const scopes = requestedScopes(stored.request);
-  const scopeInputs = scopes.map((scope) => `
+  const requested = new Set(requestedScopes(stored.request));
+  const scopeInputs = AUTH_SCOPES.map((scope) => {
+    const isRequested = requested.has(scope);
+    const unavailable = isRequested ? "" : " disabled";
+    const availability = isRequested ? "" : " <small class=\"hint\">Not requested by this client</small>";
+    return `
         <label class="scope">
-          <input type="checkbox" name="scope" value="${escapeHtml(scope)}" checked>
-          <span><strong>${escapeHtml(scope)}</strong><br>${escapeHtml(scopeLabel(scope))}</span>
-        </label>`).join("");
+          <input type="checkbox" name="scope" value="${escapeHtml(scope)}"${isRequested ? " checked" : ""}${unavailable}>
+          <span><strong>${escapeHtml(scope)}</strong>${availability}<br>${escapeHtml(scopeLabel(scope))}</span>
+        </label>`;
+  }).join("");
   const error = errorMessage ? `<p class="error" role="alert">${escapeHtml(errorMessage)}</p>` : "";
   return `<!doctype html>
 <html lang="en">
@@ -239,7 +265,7 @@ function renderLoginPage(
       ${error}
       <form method="post" action="/authorize">
         <input type="hidden" name="authorization_state" value="${escapeHtml(state)}">
-        <p>Choose the permissions to grant:</p>
+        <p>Choose the permissions to grant. Disabled permissions were not requested by this MCP client; reconnect it after refreshing its OAuth configuration to request them.</p>
         ${scopeInputs}
         <label for="icloud_email">iCloud email address</label>
         <input id="icloud_email" name="icloud_email" type="email" autocomplete="username" maxlength="320" value="${escapeHtml(emailValue.slice(0, 320))}" required>
@@ -356,9 +382,10 @@ async function completeCredentialAuthorization(
   if (!stateToken || !/^[A-Za-z0-9_-]{32,128}$/u.test(stateToken)) return jsonError("Invalid authorization state", 400);
 
   const secret = getCredentialsEncryptionSecret(env);
-  const cookie = cookieValue(request, STATE_COOKIE_NAME);
+  const cookie = cookieValue(request, stateCookieName(stateToken));
   const [cookieState, cookieSignature] = cookie?.split(".") ?? [];
-  if (cookieState !== stateToken || !cookieSignature || !(await verifyState(stateToken, cookieSignature, secret))) {
+  const cookieValid = cookieState === stateToken && Boolean(cookieSignature) && await verifyState(stateToken, cookieSignature, secret);
+  if (!cookieValid && !sameOriginFormSubmission(request)) {
     return jsonError("Invalid authorization state", 400);
   }
 
@@ -370,7 +397,7 @@ async function completeCredentialAuthorization(
     const denial = errorRedirect(stored.request, "access_denied", "Authorization was denied");
     return redirectWithCookie(
       denial.headers.get("Location") ?? stored.request.redirectUri,
-      clearStateCookie(request),
+      clearStateCookie(request, stateToken),
     );
   }
 
@@ -396,7 +423,7 @@ async function completeCredentialAuthorization(
     if (attempts >= MAX_AUTH_ATTEMPTS) {
       await env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${stateToken}`);
       const response = jsonError("iCloud credential verification failed too many times", 401);
-      response.headers.set("Set-Cookie", clearStateCookie(request));
+      response.headers.set("Set-Cookie", clearStateCookie(request, stateToken));
       return response;
     }
     const nextState = { ...stored, attempts };
@@ -429,7 +456,7 @@ async function completeCredentialAuthorization(
     props,
   });
   await env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${stateToken}`);
-  return redirectWithCookie(result.redirectTo, clearStateCookie(request));
+  return redirectWithCookie(result.redirectTo, clearStateCookie(request, stateToken));
 }
 
 function isCredentialConfigurationError(error: unknown): boolean {

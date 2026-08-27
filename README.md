@@ -73,7 +73,7 @@ npx @modelcontextprotocol/inspector http://127.0.0.1:8787/mcp
 
 ## OAuth and deployment
 
-The Worker is its own OAuth authorization server. When ChatGPT or another MCP client follows the protected-resource metadata, it opens `/authorize`. The Worker shows a local consent form, verifies the submitted iCloud account against only the selected services, encrypts the resulting credential record, and then delegates authorization-code, PKCE, access-token, refresh-token, and revocation handling to `@cloudflare/workers-oauth-provider`.
+The Worker is its own OAuth authorization server. When ChatGPT or another MCP client follows the protected-resource metadata, it opens `/authorize`. The Worker shows a local consent form, verifies the submitted iCloud account against only the selected services, encrypts the resulting credential record, and then delegates authorization-code, PKCE, access-token, refresh-token, and revocation handling to `@cloudflare/workers-oauth-provider`. The form displays all supported scopes; permissions disabled as “Not requested by this client” cannot be added to an existing OAuth request. Reconnect or reauthorize the MCP client after refreshing its OAuth metadata to request newly added scopes—OAuth refresh tokens cannot widen an existing grant.
 
 Configure one high-entropy encryption secret and keep it out of Git:
 

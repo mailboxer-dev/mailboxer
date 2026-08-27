@@ -90,8 +90,9 @@ function context(): ExecutionContext {
 function stateAndCookie(response: Response): { state: string; cookie: string } {
   const setCookie = response.headers.get("Set-Cookie") ?? "";
   const cookie = setCookie.split(";", 1)[0];
-  const value = cookie.slice("mcp_oauth_state=".length);
-  const [state] = value.split(".");
+  const [name, value = ""] = cookie.split("=", 2);
+  const state = name.slice("mcp_oauth_state_".length);
+  expect(value.startsWith(`${state}.`)).toBe(true);
   return { state, cookie };
 }
 
@@ -137,6 +138,10 @@ describe("iCloud credential OAuth authorization", () => {
     expect(body).not.toContain("MCP_LOGIN_SECRET");
     expect(response.headers.get("Set-Cookie")).toContain("HttpOnly");
     expect(response.headers.get("Set-Cookie")).toContain("Path=/authorize");
+    expect(response.headers.get("Set-Cookie")).toContain("SameSite=None");
+    expect(response.headers.get("Set-Cookie")).toContain("mcp_oauth_state_");
+    expect(body).toContain("calendar.read");
+    expect(body).toContain("contacts.read");
     expect(kv.keys()).toHaveLength(1);
   });
 
@@ -145,6 +150,47 @@ describe("iCloud credential OAuth authorization", () => {
     const response = await authFetchFor()(authorizationForm("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), oauthEnv(kv), context());
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: "Invalid authorization state" });
+  });
+
+  it("accepts a cookie-blocked same-origin form without weakening cross-site protection", async () => {
+    const kv = new MemoryKv();
+    const env = oauthEnv(kv);
+    const authFetch = authFetchFor({
+      verifyCredentials: vi.fn(async () => ({ email: "owner@icloud.com", imapUser: "owner", appPassword: "app-password" })),
+      storeCredentials: vi.fn(async () => "icloud-test-id"),
+    });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), env, context());
+    const { state } = stateAndCookie(authorize);
+    const form = authorizationForm(state);
+    form.headers.set("Origin", "https://mcp.example");
+    await expect(authFetch(form, env, context())).resolves.toMatchObject({ status: 302 });
+
+    const secondAuthorize = await authFetch(new Request("https://mcp.example/authorize"), env, context());
+    const { state: secondState } = stateAndCookie(secondAuthorize);
+    const crossSite = authorizationForm(secondState);
+    crossSite.headers.set("Origin", "https://attacker.example");
+    await expect(authFetch(crossSite, env, context())).resolves.toMatchObject({ status: 400 });
+  });
+
+  it("keeps concurrent authorization pages bound to their own state cookies", async () => {
+    const kv = new MemoryKv();
+    const env = oauthEnv(kv);
+    const authFetch = authFetchFor({
+      verifyCredentials: vi.fn(async () => ({ email: "owner@icloud.com", imapUser: "owner", appPassword: "app-password" })),
+      storeCredentials: vi.fn(async () => "icloud-test-id"),
+    });
+    const first = await authFetch(new Request("https://mcp.example/authorize"), env, context());
+    const second = await authFetch(new Request("https://mcp.example/authorize"), env, context());
+    const firstState = stateAndCookie(first);
+    const secondState = stateAndCookie(second);
+
+    const firstForm = authorizationForm(firstState.state);
+    firstForm.headers.set("Cookie", firstState.cookie);
+    const secondForm = authorizationForm(secondState.state);
+    secondForm.headers.set("Cookie", secondState.cookie);
+
+    await expect(authFetch(firstForm, env, context())).resolves.toMatchObject({ status: 302 });
+    await expect(authFetch(secondForm, env, context())).resolves.toMatchObject({ status: 302 });
   });
 
   it("does not issue a grant when iCloud credential verification fails", async () => {
