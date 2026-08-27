@@ -92,6 +92,10 @@ npx wrangler deploy
 
 The OAuth provider publishes the standard authorization-server and protected-resource discovery documents. In ChatGPT web, add the deployed `/mcp` URL and select **OAuth**; the browser will show the Worker’s login page. Do not select **No Authentication**, because every mail tool is private. Refresh tokens are generated and rotated by the OAuth provider; they are not handled by the mail code.
 
+## Observability
+
+Invocation logs and Workers Logs persistence are disabled. Cloudflare tracing is enabled at a 100% head-sampling rate and persists traces in the Cloudflare dashboard. Cloudflare automatically instruments the Worker handler and KV calls; the Worker adds custom spans for MCP requests and tools, credential verification, IMAP/SMTP sessions, protocol commands, and bounded message/recipient counts and byte sizes. Span attributes never include iCloud credentials, message content, addresses, subjects, mailbox names, or raw protocol commands. See Cloudflare’s [Workers tracing](https://developers.cloudflare.com/workers/observability/traces/) and [custom spans](https://developers.cloudflare.com/workers/observability/traces/custom-spans/) documentation.
+
 ## One-click Cloudflare deployment
 
 Use the Cloudflare button to clone, configure, and deploy the Worker into your own Cloudflare account:

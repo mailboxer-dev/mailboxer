@@ -2,6 +2,7 @@ import { z } from "zod";
 import { getCredentialsEncryptionSecret, getMailConfig } from "./config";
 import { ImapClient } from "./imap/client";
 import { SmtpClient } from "./smtp/client";
+import { withSpan } from "./tracing";
 import {
   type AppEnv,
   type MailConfig,
@@ -166,19 +167,31 @@ async function decryptCredentials(
   }
 }
 
-async function verifyImap(config: MailConfig, open: typeof ImapClient.open): Promise<void> {
-  const client = await open(config);
-  client.close();
+async function verifyImap(
+  config: MailConfig,
+  open: typeof ImapClient.open,
+  candidate: number,
+): Promise<void> {
+  return withSpan(
+    "mail.credentials.verify_imap",
+    { "mail.credentials.imap_candidate": candidate },
+    async () => {
+      const client = await open(config);
+      client.close();
+    },
+  );
 }
 
 async function verifySmtp(config: MailConfig, open: typeof SmtpClient.open): Promise<void> {
-  const client = await open(config);
-  try {
-    await client.authenticate();
-  } finally {
-    await client.quit().catch(() => undefined);
-    client.close();
-  }
+  return withSpan("mail.credentials.verify_smtp", {}, async () => {
+    const client = await open(config);
+    try {
+      await client.authenticate();
+    } finally {
+      await client.quit().catch(() => undefined);
+      client.close();
+    }
+  });
 }
 
 export async function verifyMailCredentials(
@@ -191,14 +204,14 @@ export async function verifyMailCredentials(
   const smtpOpen = dependencies.smtpOpen ?? SmtpClient.open;
   let verifiedConfig: MailConfig | undefined;
 
-  for (const imapUser of imapUserCandidates(submission.email)) {
+  for (const [index, imapUser] of imapUserCandidates(submission.email).entries()) {
     const config = getMailConfig(env, {
       email: submission.email,
       imapUser,
       appPassword: submission.appPassword,
     });
     try {
-      await verifyImap(config, imapOpen);
+      await verifyImap(config, imapOpen, index + 1);
       verifiedConfig = config;
       break;
     } catch {

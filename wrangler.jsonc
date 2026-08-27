@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "icloud-mail-mcp",
   "main": "src/index.ts",
-  "compatibility_date": "2026-08-26",
+  "compatibility_date": "2026-08-27",
   "compatibility_flags": [
     "nodejs_compat",
     "global_fetch_strictly_public"
@@ -11,8 +11,13 @@
     "enabled": true,
     "head_sampling_rate": 1,
     "logs": {
+      "enabled": false,
+      "invocation_logs": false,
+      "head_sampling_rate": 1,
+      "persist": false
+    },
+    "traces": {
       "enabled": true,
-      "invocation_logs": true,
       "head_sampling_rate": 1,
       "persist": true
     }

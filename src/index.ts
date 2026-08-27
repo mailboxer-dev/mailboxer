@@ -3,6 +3,7 @@ import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp/server";
 import { credentialAuthHandler } from "./auth";
 import { createMailServer } from "./mail-server";
+import { withSpan } from "./tracing";
 import { restrictMailPropsToTokenScope, type AppEnv, type MailAuthProps } from "./types";
 
 export class MailMcpApi extends WorkerEntrypoint<AppEnv, MailAuthProps> {
@@ -16,7 +17,14 @@ export class MailMcpApi extends WorkerEntrypoint<AppEnv, MailAuthProps> {
         authContext: { props: { ...props } },
       },
     );
-    return handler(request, this.env, this.ctx);
+    return withSpan(
+      "mcp.request",
+      {
+        "http.request.method": request.method,
+        "url.path": new URL(request.url).pathname,
+      },
+      () => handler(request, this.env, this.ctx),
+    );
   }
 }
 

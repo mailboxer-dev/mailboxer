@@ -4,6 +4,7 @@ import { MailCredentialError, getMailConfigForCredential } from "./credentials";
 import { ImapProtocolError, MessageTooLargeError, withImapConfig, type ImapClient } from "./imap/client";
 import { parseRfc822, decodeContentTransfer, encodeBase64 } from "./mime";
 import { SmtpClient, SmtpProtocolError } from "./smtp/client";
+import { withSpan } from "./tracing";
 import {
   DEFAULT_PAGE_SIZE,
   MAX_ATTACHMENT_BYTES,
@@ -70,6 +71,10 @@ function requireScope(props: MailAuthProps, scope: "mail.read" | "mail.write"): 
   }
 }
 
+function withToolSpan<T>(name: string, operation: () => Promise<T>): Promise<T> {
+  return withSpan(`mcp.tool.${name}`, { "mcp.tool.name": name }, operation);
+}
+
 async function withUserImap<T>(env: AppEnv, props: MailAuthProps, operation: (imap: ImapClient) => Promise<T>): Promise<T> {
   const config = await getMailConfigForCredential(env, props.credentialId);
   return withImapConfig(config, operation);
@@ -96,7 +101,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       inputSchema: { subscribedOnly: z.boolean().optional().default(false) },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ subscribedOnly }) => {
+    async ({ subscribedOnly }) => withToolSpan("list_mailboxes", async () => {
       try {
         requireScope(props, "mail.read");
         const mailboxes = await withUserImap(env, props, (imap) => imap.listMailboxes(subscribedOnly));
@@ -104,7 +109,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -118,7 +123,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ mailbox, beforeUid, limit }) => {
+    async ({ mailbox, beforeUid, limit }) => withToolSpan("list_messages", async () => {
       try {
         requireScope(props, "mail.read");
         const page = await withUserImap(env, props, async (imap) => {
@@ -136,7 +141,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -151,7 +156,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ mailbox, beforeUid, limit, ...filters }) => {
+    async ({ mailbox, beforeUid, limit, ...filters }) => withToolSpan("search_messages", async () => {
       try {
         requireScope(props, "mail.read");
         const page = await withUserImap(env, props, async (imap) => {
@@ -170,7 +175,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -183,7 +188,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ mailbox, uid }) => {
+    async ({ mailbox, uid }) => withToolSpan("get_message", async () => {
       try {
         requireScope(props, "mail.read");
         const message = await withUserImap(env, props, async (imap) => {
@@ -195,7 +200,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -209,7 +214,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ mailbox, uid, part }) => {
+    async ({ mailbox, uid, part }) => withToolSpan("get_attachment", async () => {
       try {
         requireScope(props, "mail.read");
         const attachment = await withUserImap(env, props, async (imap) => {
@@ -232,7 +237,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -247,7 +252,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ mailbox, uids, add, remove }) => {
+    async ({ mailbox, uids, add, remove }) => withToolSpan("set_message_flags", async () => {
       try {
         requireScope(props, "mail.write");
         const normalizedAdd = safeFlags(add);
@@ -259,7 +264,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -273,7 +278,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ sourceMailbox, destinationMailbox, uids }) => {
+    async ({ sourceMailbox, destinationMailbox, uids }) => withToolSpan("move_messages", async () => {
       try {
         requireScope(props, "mail.write");
         const normalizedUids = safeUidList(uids);
@@ -282,7 +287,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -296,7 +301,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ mailbox, uids, permanent }) => {
+    async ({ mailbox, uids, permanent }) => withToolSpan("delete_messages", async () => {
       try {
         requireScope(props, "mail.write");
         const normalizedUids = safeUidList(uids);
@@ -305,7 +310,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -329,7 +334,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ to, cc, bcc, replyTo, subject, text, html, attachments }) => {
+    async ({ to, cc, bcc, replyTo, subject, text, html, attachments }) => withToolSpan("send_email", async () => {
       try {
         requireScope(props, "mail.write");
         if (text === undefined && html === undefined) throw new Error("At least one of text or html is required");
@@ -359,7 +364,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    },
+    }),
   );
 
   return server;
