@@ -42,13 +42,7 @@ cp .dev.vars.example .dev.vars
 
 Fill `.dev.vars` with a random `MAIL_CREDENTIALS_ENCRYPTION_KEY`. iCloud credentials are entered through the `/authorize` page, not Worker variables. Use an Apple app-specific password, not the normal Apple Account password. Apple documents the iCloud Mail settings at [support.apple.com](https://support.apple.com/en-us/102525).
 
-The checked-in Wrangler config is connected to the two KV namespaces for the maintained deployment. For a fork or a separate account, create both namespaces and replace the IDs before deploying:
-
-```sh
-npx wrangler kv namespace create OAUTH_KV
-npx wrangler kv namespace create MAIL_CREDENTIALS_KV
-# Put each returned 32-character ID in wrangler.jsonc under its matching binding.
-```
+The checked-in Wrangler config intentionally contains no account-specific KV IDs. Current Wrangler versions automatically provision the two KV namespaces for local development and deployment. This keeps forks and one-click deployments isolated to the deployer's Cloudflare account.
 
 Start the Worker:
 
@@ -89,9 +83,10 @@ npm test
 npx wrangler deploy --dry-run
 ```
 
-After replacing the KV ID and setting the secrets, deploy with:
+For a terminal deployment, set the one required Worker secret and deploy. Wrangler creates the KV namespaces because their IDs are omitted from `wrangler.jsonc`:
 
 ```sh
+npx wrangler secret put MAIL_CREDENTIALS_ENCRYPTION_KEY
 npx wrangler deploy
 ```
 
@@ -99,15 +94,23 @@ The OAuth provider publishes the standard authorization-server and protected-res
 
 ## One-click Cloudflare deployment
 
-The repository includes Deploy to Cloudflare binding descriptions in `package.json` and a placeholder KV namespace ID. Cloudflare can provision the OAuth KV namespace and present the values from `.dev.vars.example` during deployment. See the [Deploy to Cloudflare documentation](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
+Use the Cloudflare button to clone, configure, and deploy the Worker into your own Cloudflare account:
 
-The source repository must be public for Cloudflare’s deploy button. Once this repository is published publicly, add this snippet to the project page:
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/antoninguyot/icloud-mail-mcp)
 
-```md
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/<owner>/icloud-mail-mcp)
-```
+The source repository must be public for the button to work. This repository is currently private, so publish it before sharing the button with other users. Cloudflare’s flow clones the repository into the deployer’s GitHub or GitLab account, lets the deployer choose the Worker and resource names, automatically provisions `OAUTH_KV` and `MAIL_CREDENTIALS_KV`, and configures Workers Builds for later pushes. See the [Deploy to Cloudflare documentation](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
 
-The deployer supplies only the encryption key during deployment. Each user enters their own iCloud email and app-specific password on the Worker’s OAuth page. The deployed Worker then works with ChatGPT’s **OAuth** option without creating a separate Access application.
+The deployer supplies the one required secret when prompted:
+
+| Binding | Configure at deploy time |
+| --- | --- |
+| `MAIL_CREDENTIALS_ENCRYPTION_KEY` | Generate a unique value with `openssl rand -hex 32`. |
+| `OAUTH_KV` | Automatically provisioned; stores OAuth state and tokens only. |
+| `MAIL_CREDENTIALS_KV` | Automatically provisioned; stores encrypted iCloud credentials only. |
+
+The binding descriptions in `package.json` and the example secret in `.dev.vars.example` are used to explain the deployment inputs. No iCloud email or app-specific password is required during deployment: each user enters their own credentials later on the Worker’s OAuth page.
+
+After deployment, connect the deployed `https://<worker-name>.<account>.workers.dev/mcp` URL to the MCP client using **OAuth**. Do not select **No Authentication**: the mail tools are private.
 
 ## Sending and deletion safety
 

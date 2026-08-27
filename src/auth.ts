@@ -424,15 +424,6 @@ async function completeCredentialAuthorization(
     scope: grantedScopes,
     props,
   });
-  const redirect = new URL(result.redirectTo);
-  console.info(JSON.stringify({
-    event: "oauth.authorization_redirect_issued",
-    callbackHost: redirect.host,
-    callbackPath: redirect.pathname,
-    hasAuthorizationCode: redirect.searchParams.has("code"),
-    hasClientState: redirect.searchParams.has("state"),
-    hasIssuer: redirect.searchParams.has("iss"),
-  }));
   await env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${stateToken}`);
   return redirectWithCookie(result.redirectTo, clearStateCookie(request));
 }
@@ -465,7 +456,6 @@ export function createCredentialAuthHandler(dependencies: CredentialAuthDependen
         return new Response("Not found", { status: 404 });
       } catch (error) {
         if (isCredentialConfigurationError(error)) return jsonError("Mail credential storage is not configured", 503);
-        console.error(JSON.stringify({ event: "oauth.authorization_failed", error: error instanceof Error ? error.name : "unknown" }));
         return jsonError("OAuth authorization failed", 502);
       }
     },

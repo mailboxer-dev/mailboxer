@@ -24,12 +24,10 @@
   },
   "kv_namespaces": [
     {
-      "binding": "OAUTH_KV",
-      "id": "dd49a6cb6f1944c58c73fde5535142e3"
+      "binding": "OAUTH_KV"
     },
     {
-      "binding": "MAIL_CREDENTIALS_KV",
-      "id": "f4dace26eb7c47ff98830679090a41e9"
+      "binding": "MAIL_CREDENTIALS_KV"
     }
   ],
   "vars": {

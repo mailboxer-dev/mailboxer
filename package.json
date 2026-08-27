@@ -17,6 +17,12 @@
   },
   "cloudflare": {
     "bindings": {
+      "OAUTH_KV": {
+        "description": "Automatically provision a KV namespace for OAuth clients, authorization state, grants, access tokens, and refresh tokens. It must not contain mail content."
+      },
+      "MAIL_CREDENTIALS_KV": {
+        "description": "Automatically provision a KV namespace for encrypted per-user iCloud credentials."
+      },
       "MAIL_CREDENTIALS_ENCRYPTION_KEY": {
         "description": "Encryption key for per-user iCloud credentials. Generate with `openssl rand -hex 32`; do not reuse your iCloud password."
       }
