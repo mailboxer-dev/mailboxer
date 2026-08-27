@@ -1,13 +1,13 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { ImapProtocolError, MessageTooLargeError, withImap } from "./imap/client";
+import { MailCredentialError, getMailConfigForCredential } from "./credentials";
+import { ImapProtocolError, MessageTooLargeError, withImapConfig, type ImapClient } from "./imap/client";
 import { parseRfc822, decodeContentTransfer, encodeBase64 } from "./mime";
 import { SmtpClient, SmtpProtocolError } from "./smtp/client";
 import {
   DEFAULT_PAGE_SIZE,
   MAX_ATTACHMENT_BYTES,
   MAX_ATTACHMENT_COUNT,
-  OWNER_USER_ID,
   type MailAuthProps,
   type MessageMetadata,
   type AppEnv,
@@ -44,6 +44,7 @@ function textResult(value: unknown, isError = false): { content: [{ type: "text"
 function publicError(error: unknown): string {
   if (error instanceof MessageTooLargeError) return error.message;
   if (error instanceof ImapProtocolError || error instanceof SmtpProtocolError) return error.message;
+  if (error instanceof MailCredentialError) return error.message;
   if (error instanceof Error && error.message.startsWith("Missing Worker")) return "Mail credentials are not configured";
   if (error instanceof z.ZodError) return "Input failed validation";
   return "Mail operation failed";
@@ -64,9 +65,14 @@ function safeFlags(flags: string[]): string[] {
 }
 
 function requireScope(props: MailAuthProps, scope: "mail.read" | "mail.write"): void {
-  if (props?.userId !== OWNER_USER_ID || !props.scopes.includes(scope)) {
+  if (!props?.userId || props.userId !== props.credentialId || !props.credentialId || !props.scopes.includes(scope)) {
     throw new Error(`Missing required scope: ${scope}`);
   }
+}
+
+async function withUserImap<T>(env: AppEnv, props: MailAuthProps, operation: (imap: ImapClient) => Promise<T>): Promise<T> {
+  const config = await getMailConfigForCredential(env, props.credentialId);
+  return withImapConfig(config, operation);
 }
 
 function pageUids(uids: number[], beforeUid: number | undefined, limit: number): { selected: number[]; hasMore: boolean } {
@@ -93,7 +99,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     async ({ subscribedOnly }) => {
       try {
         requireScope(props, "mail.read");
-        const mailboxes = await withImap(env, (imap) => imap.listMailboxes(subscribedOnly));
+        const mailboxes = await withUserImap(env, props, (imap) => imap.listMailboxes(subscribedOnly));
         return textResult({ mailboxes });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
@@ -115,7 +121,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     async ({ mailbox, beforeUid, limit }) => {
       try {
         requireScope(props, "mail.read");
-        const page = await withImap(env, async (imap) => {
+        const page = await withUserImap(env, props, async (imap) => {
           const uids = await imap.search(mailbox, {});
           const selected = pageUids(uids, beforeUid, limit);
           const messages: MessageMetadata[] = [];
@@ -148,7 +154,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     async ({ mailbox, beforeUid, limit, ...filters }) => {
       try {
         requireScope(props, "mail.read");
-        const page = await withImap(env, async (imap) => {
+        const page = await withUserImap(env, props, async (imap) => {
           const uids = await imap.search(mailbox, filters);
           const selected = pageUids(uids, beforeUid, limit);
           const messages: MessageMetadata[] = [];
@@ -180,7 +186,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     async ({ mailbox, uid }) => {
       try {
         requireScope(props, "mail.read");
-        const message = await withImap(env, async (imap) => {
+        const message = await withUserImap(env, props, async (imap) => {
           const metadata = await imap.fetchMetadata(mailbox, uid);
           const raw = await imap.fetchRaw(mailbox, uid, metadata.size);
           return parseRfc822(raw, metadata, metadata.attachments);
@@ -206,7 +212,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     async ({ mailbox, uid, part }) => {
       try {
         requireScope(props, "mail.read");
-        const attachment = await withImap(env, async (imap) => {
+        const attachment = await withUserImap(env, props, async (imap) => {
           const metadata = await imap.fetchMetadata(mailbox, uid);
           const descriptor = metadata.attachments.find((candidate) => candidate.part === part);
           if (!descriptor) throw new Error("Attachment part was not found in BODYSTRUCTURE");
@@ -248,7 +254,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
         const normalizedRemove = safeFlags(remove);
         if (!normalizedAdd.length && !normalizedRemove.length) throw new Error("At least one flag change is required");
         const normalizedUids = safeUidList(uids);
-        await withImap(env, (imap) => imap.setFlags(mailbox, normalizedUids, normalizedAdd, normalizedRemove));
+        await withUserImap(env, props, (imap) => imap.setFlags(mailbox, normalizedUids, normalizedAdd, normalizedRemove));
         return textResult({ mailbox, uids: normalizedUids, added: normalizedAdd, removed: normalizedRemove });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
@@ -271,7 +277,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       try {
         requireScope(props, "mail.write");
         const normalizedUids = safeUidList(uids);
-        await withImap(env, (imap) => imap.moveMessages(sourceMailbox, destinationMailbox, normalizedUids));
+        await withUserImap(env, props, (imap) => imap.moveMessages(sourceMailbox, destinationMailbox, normalizedUids));
         return textResult({ sourceMailbox, destinationMailbox, uids: normalizedUids, moved: true });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
@@ -294,7 +300,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       try {
         requireScope(props, "mail.write");
         const normalizedUids = safeUidList(uids);
-        const destination = await withImap(env, (imap) => imap.deleteMessages(mailbox, normalizedUids, permanent));
+        const destination = await withUserImap(env, props, (imap) => imap.deleteMessages(mailbox, normalizedUids, permanent));
         return textResult({ mailbox, uids: normalizedUids, permanent, destination });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
@@ -327,8 +333,9 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       try {
         requireScope(props, "mail.write");
         if (text === undefined && html === undefined) throw new Error("At least one of text or html is required");
-        const composed = await SmtpClient.sendWithEnv(env, {
-          from: env.ICLOUD_EMAIL,
+        const config = await getMailConfigForCredential(env, props.credentialId);
+        const composed = await SmtpClient.sendWithConfig(config, {
+          from: config.email,
           to,
           cc,
           bcc,
@@ -339,7 +346,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
           attachments,
         });
         try {
-          const sentMailbox = await withImap(env, (imap) => imap.appendToSent(composed.raw));
+          const sentMailbox = await withImapConfig(config, (imap) => imap.appendToSent(composed.raw));
           return textResult({ delivery: "sent", sentSaved: true, sentMailbox, messageId: composed.messageId });
         } catch (error) {
           return textResult({

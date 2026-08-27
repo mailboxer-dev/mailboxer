@@ -4,10 +4,8 @@ import worker from "../src/index";
 
 const env = {
   OAUTH_KV: {} as KVNamespace,
-  MCP_LOGIN_SECRET: "a-secure-test-login-secret-with-32-chars",
-  ICLOUD_EMAIL: "owner@icloud.com",
-  ICLOUD_IMAP_USER: "owner",
-  ICLOUD_APP_PASSWORD: "app-password",
+  MAIL_CREDENTIALS_KV: {} as KVNamespace,
+  MAIL_CREDENTIALS_ENCRYPTION_KEY: "a-secure-test-encryption-key-with-32-chars",
   IMAP_HOST: "imap.mail.me.com",
   IMAP_PORT: "993",
   SMTP_HOST: "smtp.mail.me.com",

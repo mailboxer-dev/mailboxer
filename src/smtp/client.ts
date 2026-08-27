@@ -1,5 +1,4 @@
 import { connect } from "cloudflare:sockets";
-import { getMailConfig } from "../config";
 import {
   composeRfc822,
   dotStuffForSmtp,
@@ -47,6 +46,7 @@ export class SmtpClient {
   private readonly connection: SocketConnection;
   private readonly config: MailConfig;
   private capabilities = new Set<string>();
+  private authenticated = false;
 
   private constructor(connection: SocketConnection, config: MailConfig) {
     this.connection = connection;
@@ -99,14 +99,20 @@ export class SmtpClient {
     return new Set(reply.lines.map((line) => line.trim().split(/\s+/u)[0].toUpperCase()));
   }
 
-  async send(input: ComposeInput): Promise<{ raw: Uint8Array; messageId: string }> {
-    const composed = composeRfc822({ ...input, from: this.config.email });
+  async authenticate(): Promise<void> {
+    if (this.authenticated) return;
     if (!this.capabilities.has("STARTTLS")) throw new SmtpProtocolError("SMTP server does not advertise STARTTLS");
     await this.command("STARTTLS", 220);
     await this.connection.startTls();
     this.capabilities = await this.ehlo();
     const auth = base64Encode(`\u0000${this.config.email}\u0000${this.config.password}`);
     await this.command(`AUTH PLAIN ${auth}`, 235);
+    this.authenticated = true;
+  }
+
+  async send(input: ComposeInput): Promise<{ raw: Uint8Array; messageId: string }> {
+    const composed = composeRfc822({ ...input, from: this.config.email });
+    await this.authenticate();
 
     const from = validateAddress(this.config.email);
     const recipients = smtpRecipients(input);
@@ -132,8 +138,7 @@ export class SmtpClient {
     this.connection.close();
   }
 
-  static async sendWithEnv(env: AppEnv, input: ComposeInput): Promise<{ raw: Uint8Array; messageId: string }> {
-    const config = getMailConfig(env);
+  static async sendWithConfig(config: MailConfig, input: ComposeInput): Promise<{ raw: Uint8Array; messageId: string }> {
     const client = await SmtpClient.open(config);
     try {
       return await client.send(input);
@@ -143,13 +148,3 @@ export class SmtpClient {
     }
   }
 }
-
-type AppEnv = Env & {
-  ICLOUD_EMAIL: string;
-  ICLOUD_IMAP_USER: string;
-  ICLOUD_APP_PASSWORD: string;
-  IMAP_HOST?: string;
-  IMAP_PORT?: string;
-  SMTP_HOST?: string;
-  SMTP_PORT?: string;
-};

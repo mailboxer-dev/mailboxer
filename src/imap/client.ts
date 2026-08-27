@@ -1,5 +1,4 @@
 import { connect } from "cloudflare:sockets";
-import { getMailConfig } from "../config";
 import {
   formatUidSet,
   quoteImapMailboxName,
@@ -9,10 +8,10 @@ import { parseFetchMetadata, parseListLine, parseSearchResponse } from "./parser
 import {
   MAX_ATTACHMENT_BYTES,
   MAX_MESSAGE_BYTES,
-  type MailConfig,
   type Mailbox,
   type MessageMetadata,
 } from "../types";
+import type { MailConfig } from "../types";
 import { SocketConnection, withTimeout, type SocketLike } from "../network";
 import { compileSearch, type SearchFilters } from "./search";
 
@@ -291,23 +290,13 @@ export class ImapClient {
     this.connection.close();
   }
 
-  static async fromEnv(env: AppEnv): Promise<ImapClient> {
-    return ImapClient.open(getMailConfig(env));
+  static async fromConfig(config: MailConfig): Promise<ImapClient> {
+    return ImapClient.open(config);
   }
 }
 
-type AppEnv = Env & {
-  ICLOUD_EMAIL: string;
-  ICLOUD_IMAP_USER: string;
-  ICLOUD_APP_PASSWORD: string;
-  IMAP_HOST?: string;
-  IMAP_PORT?: string;
-  SMTP_HOST?: string;
-  SMTP_PORT?: string;
-};
-
-export async function withImap<T>(env: AppEnv, operation: (client: ImapClient) => Promise<T>): Promise<T> {
-  const client = await ImapClient.fromEnv(env);
+export async function withImapConfig<T>(config: MailConfig, operation: (client: ImapClient) => Promise<T>): Promise<T> {
+  const client = await ImapClient.fromConfig(config);
   try {
     return await operation(client);
   } finally {

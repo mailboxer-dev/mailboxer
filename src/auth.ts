@@ -3,20 +3,30 @@ import {
   type AuthRequest,
 } from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
-import { getOwnerLoginSecret } from "./config";
-import { MAIL_SCOPES, OWNER_USER_ID, type OAuthEnv } from "./types";
+import { getCredentialsEncryptionSecret } from "./config";
+import {
+  MailCredentialError,
+  storeMailCredentials,
+  verifyMailCredentials,
+} from "./credentials";
+import { MAIL_SCOPES, type MailCredentials, type OAuthEnv } from "./types";
 
 const AUTH_STATE_TTL_SECONDS = 600;
 const MAX_AUTH_ATTEMPTS = 5;
 const MAX_FORM_BYTES = 16 * 1024;
-const STATE_KEY_PREFIX = "owner:state:";
-const STATE_COOKIE_NAME = "mcp_owner_state";
+const STATE_KEY_PREFIX = "mail-oauth:state:";
+const STATE_COOKIE_NAME = "mcp_oauth_state";
 const AUTH_SCOPES = [...MAIL_SCOPES, "offline_access"] as const;
 
-interface StoredOwnerAuthState {
+interface StoredAuthState {
   request: AuthRequest;
   clientName: string;
   attempts: number;
+}
+
+export interface CredentialAuthDependencies {
+  verifyCredentials?: (env: OAuthEnv, input: unknown) => Promise<MailCredentials>;
+  storeCredentials?: (env: OAuthEnv, credentials: MailCredentials) => Promise<string>;
 }
 
 const authRequestSchema = z.object({
@@ -36,10 +46,6 @@ const storedStateSchema = z.object({
   clientName: z.string().max(256),
   attempts: z.number().int().min(0).max(MAX_AUTH_ATTEMPTS),
 });
-
-interface CloudflareSubtleCrypto extends SubtleCrypto {
-  timingSafeEqual(a: ArrayBuffer | ArrayBufferView, b: ArrayBuffer | ArrayBufferView): boolean;
-}
 
 function base64UrlEncode(bytes: Uint8Array): string {
   let binary = "";
@@ -64,9 +70,10 @@ function randomToken(byteLength = 32): string {
 }
 
 async function signState(value: string, secret: string): Promise<string> {
+  const encodedSecret = new TextEncoder().encode(secret);
   const key = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(secret),
+    asArrayBuffer(encodedSecret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
@@ -77,14 +84,15 @@ async function signState(value: string, secret: string): Promise<string> {
 
 async function verifyState(value: string, signature: string, secret: string): Promise<boolean> {
   try {
+    const encodedSecret = new TextEncoder().encode(secret);
     const key = await crypto.subtle.importKey(
       "raw",
-      new TextEncoder().encode(secret),
+      asArrayBuffer(encodedSecret),
       { name: "HMAC", hash: "SHA-256" },
       false,
       ["verify"],
     );
-    return crypto.subtle.verify(
+    return await crypto.subtle.verify(
       "HMAC",
       key,
       asArrayBuffer(base64UrlDecode(signature)),
@@ -93,22 +101,6 @@ async function verifyState(value: string, signature: string, secret: string): Pr
   } catch {
     return false;
   }
-}
-
-async function secretsMatch(candidate: string, expected: string): Promise<boolean> {
-  const [candidateDigest, expectedDigest] = await Promise.all([
-    crypto.subtle.digest("SHA-256", new TextEncoder().encode(candidate)),
-    crypto.subtle.digest("SHA-256", new TextEncoder().encode(expected)),
-  ]);
-  const subtle = crypto.subtle as CloudflareSubtleCrypto;
-  if (typeof subtle.timingSafeEqual === "function") return subtle.timingSafeEqual(candidateDigest, expectedDigest);
-  const left = new Uint8Array(candidateDigest);
-  const right = new Uint8Array(expectedDigest);
-  let difference = left.length ^ right.length;
-  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
-    difference |= (left[index] ?? 0) ^ (right[index] ?? 0);
-  }
-  return difference === 0;
 }
 
 function cookieValue(request: Request, name: string): string | null {
@@ -182,13 +174,17 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/gu, (character) => entities[character]);
 }
 
-function asStoredState(value: unknown): StoredOwnerAuthState | null {
+function asStoredState(value: unknown): StoredAuthState | null {
   const parsed = storedStateSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
 }
 
 function requestedScopes(request: AuthRequest): Array<(typeof AUTH_SCOPES)[number]> {
   return AUTH_SCOPES.filter((scope) => request.scope.includes(scope));
+}
+
+function mailScopes(scopes: readonly string[]): string[] {
+  return scopes.filter((scope) => (MAIL_SCOPES as readonly string[]).includes(scope));
 }
 
 function scopeLabel(scope: (typeof AUTH_SCOPES)[number]): string {
@@ -199,8 +195,9 @@ function scopeLabel(scope: (typeof AUTH_SCOPES)[number]): string {
 
 function renderLoginPage(
   state: string,
-  stored: StoredOwnerAuthState,
+  stored: StoredAuthState,
   errorMessage?: string,
+  emailValue = "",
 ): string {
   const scopes = requestedScopes(stored.request);
   const scopeInputs = scopes.map((scope) => `
@@ -223,14 +220,15 @@ function renderLoginPage(
       p { line-height: 1.5; }
       .scope { display: flex; gap: .75rem; align-items: flex-start; padding: .75rem; margin: .5rem 0; border: 1px solid #d9dde7; border-radius: .6rem; }
       .scope input { margin-top: .25rem; }
-      label[for="secret"] { display: block; margin-top: 1.25rem; font-weight: 600; }
-      input[type="password"] { box-sizing: border-box; width: 100%; margin-top: .5rem; padding: .7rem; border: 1px solid #aeb5c5; border-radius: .5rem; font: inherit; }
+      label[for="icloud_email"], label[for="icloud_app_password"] { display: block; margin-top: 1.25rem; font-weight: 600; }
+      input[type="email"], input[type="password"] { box-sizing: border-box; width: 100%; margin-top: .5rem; padding: .7rem; border: 1px solid #aeb5c5; border-radius: .5rem; font: inherit; }
+      .hint { color: #526078; font-size: .92rem; }
       .actions { display: flex; gap: .75rem; margin-top: 1.5rem; }
       button { flex: 1; padding: .7rem 1rem; border: 0; border-radius: .5rem; font: inherit; cursor: pointer; }
       button[value="approve"] { background: #2563eb; color: white; }
       button[value="deny"] { background: #e7eaf0; color: #172033; }
       .error { padding: .75rem; border-radius: .5rem; background: #fee2e2; color: #991b1b; }
-      @media (prefers-color-scheme: dark) { body { background: #111827; color: #eef2ff; } main { background: #1f2937; border-color: #4b5563; } .scope { border-color: #4b5563; } input[type="password"] { background: #111827; color: #eef2ff; border-color: #6b7280; } button[value="deny"] { background: #374151; color: #eef2ff; } .error { background: #451a1a; color: #fecaca; } }
+      @media (prefers-color-scheme: dark) { body { background: #111827; color: #eef2ff; } main { background: #1f2937; border-color: #4b5563; } .scope { border-color: #4b5563; } input[type="email"], input[type="password"] { background: #111827; color: #eef2ff; border-color: #6b7280; } button[value="deny"] { background: #374151; color: #eef2ff; } .error { background: #451a1a; color: #fecaca; } .hint { color: #c0c9da; } }
     </style>
   </head>
   <body>
@@ -242,8 +240,11 @@ function renderLoginPage(
         <input type="hidden" name="authorization_state" value="${escapeHtml(state)}">
         <p>Choose the permissions to grant:</p>
         ${scopeInputs}
-        <label for="secret">Deployment login secret</label>
-        <input id="secret" name="login_secret" type="password" autocomplete="current-password" required maxlength="256">
+        <label for="icloud_email">iCloud email address</label>
+        <input id="icloud_email" name="icloud_email" type="email" autocomplete="username" maxlength="320" value="${escapeHtml(emailValue.slice(0, 320))}" required>
+        <label for="icloud_app_password">Apple app-specific password</label>
+        <input id="icloud_app_password" name="icloud_app_password" type="password" autocomplete="current-password" maxlength="256" required>
+        <p class="hint">Use an Apple app-specific password, not your normal Apple Account password. The Worker verifies it against iCloud and stores it encrypted.</p>
         <div class="actions">
           <button type="submit" name="decision" value="deny">Cancel</button>
           <button type="submit" name="decision" value="approve">Authorize</button>
@@ -292,7 +293,12 @@ async function readForm(request: Request): Promise<URLSearchParams> {
   return new URLSearchParams(new TextDecoder().decode(await readBoundedBody(request)));
 }
 
-async function beginOwnerAuthorization(request: Request, env: OAuthEnv): Promise<Response> {
+function assertCredentialConfiguration(env: OAuthEnv): void {
+  getCredentialsEncryptionSecret(env);
+  if (!env.MAIL_CREDENTIALS_KV) throw new Error("MAIL_CREDENTIALS_KV binding is not configured");
+}
+
+async function beginCredentialAuthorization(request: Request, env: OAuthEnv): Promise<Response> {
   let oauthRequest: AuthRequest;
   try {
     oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
@@ -319,14 +325,15 @@ async function beginOwnerAuthorization(request: Request, env: OAuthEnv): Promise
   if (oauthRequest.codeChallengeMethod !== "S256" || !oauthRequest.codeChallenge) {
     return errorRedirect(oauthRequest, "invalid_request", "PKCE S256 is required");
   }
-  if (!requestedScopes(oauthRequest).some((scope) => (MAIL_SCOPES as readonly string[]).includes(scope))) {
+  if (!mailScopes(requestedScopes(oauthRequest)).length) {
     return errorRedirect(oauthRequest, "invalid_scope", "Request mail.read or mail.write");
   }
 
-  const secret = getOwnerLoginSecret(env);
+  assertCredentialConfiguration(env);
+  const secret = getCredentialsEncryptionSecret(env);
   const state = randomToken(32);
   const signature = await signState(state, secret);
-  const stored: StoredOwnerAuthState = {
+  const stored: StoredAuthState = {
     request: oauthRequest,
     clientName: client.clientName?.slice(0, 256) || "MCP client",
     attempts: 0,
@@ -337,12 +344,17 @@ async function beginOwnerAuthorization(request: Request, env: OAuthEnv): Promise
   return htmlResponse(renderLoginPage(state, stored), 200, stateCookie(request, state, signature));
 }
 
-async function completeOwnerAuthorization(request: Request, env: OAuthEnv): Promise<Response> {
+async function completeCredentialAuthorization(
+  request: Request,
+  env: OAuthEnv,
+  dependencies: Required<CredentialAuthDependencies>,
+): Promise<Response> {
+  assertCredentialConfiguration(env);
   const form = await readForm(request);
   const stateToken = form.get("authorization_state")?.trim() ?? "";
   if (!stateToken || !/^[A-Za-z0-9_-]{32,128}$/u.test(stateToken)) return jsonError("Invalid authorization state", 400);
 
-  const secret = getOwnerLoginSecret(env);
+  const secret = getCredentialsEncryptionSecret(env);
   const cookie = cookieValue(request, STATE_COOKIE_NAME);
   const [cookieState, cookieSignature] = cookie?.split(".") ?? [];
   if (cookieState !== stateToken || !cookieSignature || !(await verifyState(stateToken, cookieSignature, secret))) {
@@ -354,18 +366,35 @@ async function completeOwnerAuthorization(request: Request, env: OAuthEnv): Prom
 
   if (form.get("decision") !== "approve") {
     await env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${stateToken}`);
+    const denial = errorRedirect(stored.request, "access_denied", "Authorization was denied");
     return redirectWithCookie(
-      errorRedirect(stored.request, "access_denied", "Authorization was denied").headers.get("Location") ?? stored.request.redirectUri,
+      denial.headers.get("Location") ?? stored.request.redirectUri,
       clearStateCookie(request),
     );
   }
 
-  const loginSecret = form.get("login_secret") ?? "";
-  if (loginSecret.length > 256 || !(await secretsMatch(loginSecret, secret))) {
+  const selectedScopes = new Set(form.getAll("scope"));
+  const grantedScopes = requestedScopes(stored.request).filter((scope) => selectedScopes.has(scope));
+  const grantedMailScopes = mailScopes(grantedScopes);
+  if (!grantedMailScopes.length) {
+    return htmlResponse(
+      renderLoginPage(stateToken, stored, "Select at least one mail permission.", form.get("icloud_email") ?? ""),
+      400,
+      stateCookie(request, stateToken, cookieSignature),
+    );
+  }
+
+  const email = form.get("icloud_email") ?? "";
+  const appPassword = form.get("icloud_app_password") ?? "";
+  let credentials: MailCredentials;
+  try {
+    credentials = await dependencies.verifyCredentials(env, { email, appPassword });
+  } catch (error) {
+    if (!(error instanceof MailCredentialError)) throw error;
     const attempts = stored.attempts + 1;
     if (attempts >= MAX_AUTH_ATTEMPTS) {
       await env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${stateToken}`);
-      const response = jsonError("Owner authentication failed", 401);
+      const response = jsonError("iCloud credential verification failed too many times", 401);
       response.headers.set("Set-Cookie", clearStateCookie(request));
       return response;
     }
@@ -374,56 +403,67 @@ async function completeOwnerAuthorization(request: Request, env: OAuthEnv): Prom
       expirationTtl: AUTH_STATE_TTL_SECONDS,
     });
     return htmlResponse(
-      renderLoginPage(stateToken, nextState, "The deployment login secret is incorrect."),
+      renderLoginPage(
+        stateToken,
+        nextState,
+        "The iCloud credentials could not be verified. Check the email and app-specific password.",
+        email,
+      ),
       401,
       stateCookie(request, stateToken, cookieSignature),
     );
   }
 
-  const selectedScopes = new Set(form.getAll("scope"));
-  const grantedScopes = requestedScopes(stored.request).filter((scope) => selectedScopes.has(scope));
-  if (!grantedScopes.some((scope) => (MAIL_SCOPES as readonly string[]).includes(scope))) {
-    return htmlResponse(renderLoginPage(stateToken, stored, "Select at least one mail permission."), 400, stateCookie(request, stateToken, cookieSignature));
-  }
-
-  await env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${stateToken}`);
+  const credentialId = await dependencies.storeCredentials(env, credentials);
+  const props = {
+    userId: credentialId,
+    credentialId,
+    scopes: grantedMailScopes,
+  };
   const result = await env.OAUTH_PROVIDER.completeAuthorization({
     request: stored.request,
-    userId: OWNER_USER_ID,
+    userId: credentialId,
     metadata: { clientName: stored.clientName },
     scope: grantedScopes,
-    props: {
-      userId: OWNER_USER_ID,
-      scopes: grantedScopes.filter((scope) => (MAIL_SCOPES as readonly string[]).includes(scope)),
-    },
+    props,
   });
+  await env.OAUTH_KV.delete(`${STATE_KEY_PREFIX}${stateToken}`);
   return redirectWithCookie(result.redirectTo, clearStateCookie(request));
 }
 
-function isLoginConfigurationError(error: unknown): boolean {
+function isCredentialConfigurationError(error: unknown): boolean {
   return error instanceof Error && (
-    error.message.startsWith("Missing Worker secret") ||
-    error.message.startsWith("MCP_LOGIN_SECRET must")
+    error.message.startsWith("Missing Worker secret or variable: MAIL_CREDENTIALS_ENCRYPTION_KEY") ||
+    error.message.startsWith("MAIL_CREDENTIALS_ENCRYPTION_KEY must") ||
+    error.message === "MAIL_CREDENTIALS_KV binding is not configured"
   );
 }
 
-export const ownerAuthHandler: ExportedHandler<OAuthEnv> = {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    try {
-      if (url.pathname === "/authorize") {
-        if (request.method === "GET") return await beginOwnerAuthorization(request, env);
-        if (request.method === "POST") return await completeOwnerAuthorization(request, env);
-        return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
+export function createCredentialAuthHandler(dependencies: CredentialAuthDependencies = {}): ExportedHandler<OAuthEnv> {
+  const resolved: Required<CredentialAuthDependencies> = {
+    verifyCredentials: dependencies.verifyCredentials ?? ((env, input) => verifyMailCredentials(env, input)),
+    storeCredentials: dependencies.storeCredentials ?? storeMailCredentials,
+  };
+  return {
+    async fetch(request, env) {
+      const url = new URL(request.url);
+      try {
+        if (url.pathname === "/authorize") {
+          if (request.method === "GET") return await beginCredentialAuthorization(request, env);
+          if (request.method === "POST") return await completeCredentialAuthorization(request, env, resolved);
+          return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
+        }
+        if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) {
+          return Response.json({ name: "icloud-mail-mcp", endpoint: "/mcp", status: "ok" });
+        }
+        return new Response("Not found", { status: 404 });
+      } catch (error) {
+        if (isCredentialConfigurationError(error)) return jsonError("Mail credential storage is not configured", 503);
+        console.error(JSON.stringify({ event: "oauth.authorization_failed", error: error instanceof Error ? error.name : "unknown" }));
+        return jsonError("OAuth authorization failed", 502);
       }
-      if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) {
-        return Response.json({ name: "icloud-mail-mcp", endpoint: "/mcp", status: "ok" });
-      }
-      return new Response("Not found", { status: 404 });
-    } catch (error) {
-      if (isLoginConfigurationError(error)) return jsonError("Owner login is not configured", 503);
-      console.error(JSON.stringify({ event: "oauth.authorization_failed", error: error instanceof Error ? error.name : "unknown" }));
-      return jsonError("OAuth authorization failed", 502);
-    }
-  },
-};
+    },
+  };
+}
+
+export const credentialAuthHandler = createCredentialAuthHandler();

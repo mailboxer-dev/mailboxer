@@ -17,17 +17,8 @@
   },
   "cloudflare": {
     "bindings": {
-      "MCP_LOGIN_SECRET": {
-        "description": "Owner-only OAuth login secret. Generate a random value with `openssl rand -hex 32`; do not reuse your iCloud password."
-      },
-      "ICLOUD_EMAIL": {
-        "description": "The iCloud Mail address this Worker will access."
-      },
-      "ICLOUD_IMAP_USER": {
-        "description": "The iCloud IMAP username, usually the local part of the email address."
-      },
-      "ICLOUD_APP_PASSWORD": {
-        "description": "An Apple app-specific password for iCloud Mail, not the normal Apple Account password."
+      "MAIL_CREDENTIALS_ENCRYPTION_KEY": {
+        "description": "Encryption key for per-user iCloud credentials. Generate with `openssl rand -hex 32`; do not reuse your iCloud password."
       }
     }
   },

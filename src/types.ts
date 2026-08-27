@@ -3,26 +3,24 @@ import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 export const MAIL_SCOPES = ["mail.read", "mail.write"] as const;
 export type MailScope = (typeof MAIL_SCOPES)[number];
 
-export const OWNER_USER_ID = "owner";
-
 export interface MailAuthProps {
   userId: string;
+  credentialId: string;
   scopes: string[];
 }
 
 export function restrictMailPropsToTokenScope(props: unknown, scopes: string[]): MailAuthProps {
   const record = props && typeof props === "object" ? props as Record<string, unknown> : {};
   const userId = typeof record.userId === "string" ? record.userId : "";
+  const credentialId = typeof record.credentialId === "string" ? record.credentialId : "";
   const mailScopes = scopes.filter((scope) => (MAIL_SCOPES as readonly string[]).includes(scope));
-  return { userId, scopes: mailScopes };
+  return { userId, credentialId, scopes: mailScopes };
 }
 
 export type AppEnv = Env & {
   OAUTH_PROVIDER: OAuthHelpers;
-  MCP_LOGIN_SECRET: string;
-  ICLOUD_EMAIL: string;
-  ICLOUD_IMAP_USER: string;
-  ICLOUD_APP_PASSWORD: string;
+  MAIL_CREDENTIALS_KV: KVNamespace;
+  MAIL_CREDENTIALS_ENCRYPTION_KEY: string;
 };
 
 export type OAuthEnv = AppEnv & { OAUTH_PROVIDER: OAuthHelpers };
@@ -35,6 +33,12 @@ export interface MailConfig {
   imapPort: number;
   smtpHost: string;
   smtpPort: number;
+}
+
+export interface MailCredentials {
+  email: string;
+  imapUser: string;
+  appPassword: string;
 }
 
 export interface Mailbox {

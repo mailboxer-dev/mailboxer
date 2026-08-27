@@ -1,7 +1,4 @@
-# Owner-only OAuth login. Generate with: openssl rand -hex 32
-MCP_LOGIN_SECRET=
-
-# iCloud Mail credentials. Use an Apple app-specific password.
-ICLOUD_EMAIL=
-ICLOUD_IMAP_USER=
-ICLOUD_APP_PASSWORD=
+# Signs OAuth authorization state and derives the encryption key for the
+# per-account iCloud credential records in MAIL_CREDENTIALS_KV.
+# Generate with: openssl rand -hex 32
+MAIL_CREDENTIALS_ENCRYPTION_KEY=

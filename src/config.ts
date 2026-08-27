@@ -1,6 +1,6 @@
-import type { AppEnv, MailConfig } from "./types";
+import type { AppEnv, MailConfig, MailCredentials } from "./types";
 
-export type MailSettingsEnv = Pick<AppEnv, "ICLOUD_EMAIL" | "ICLOUD_IMAP_USER" | "ICLOUD_APP_PASSWORD"> & {
+export type MailSettingsEnv = Pick<AppEnv, "IMAP_HOST" | "IMAP_PORT" | "SMTP_HOST" | "SMTP_PORT"> & {
   IMAP_HOST?: string;
   IMAP_PORT?: string;
   SMTP_HOST?: string;
@@ -14,9 +14,9 @@ function required(value: string | undefined, name: string): string {
   return value.trim();
 }
 
-export function getOwnerLoginSecret(env: Pick<AppEnv, "MCP_LOGIN_SECRET">): string {
-  const secret = required(env.MCP_LOGIN_SECRET, "MCP_LOGIN_SECRET");
-  if (secret.length < 32) throw new Error("MCP_LOGIN_SECRET must contain at least 32 characters");
+export function getCredentialsEncryptionSecret(env: Pick<AppEnv, "MAIL_CREDENTIALS_ENCRYPTION_KEY">): string {
+  const secret = required(env.MAIL_CREDENTIALS_ENCRYPTION_KEY, "MAIL_CREDENTIALS_ENCRYPTION_KEY");
+  if (secret.length < 32) throw new Error("MAIL_CREDENTIALS_ENCRYPTION_KEY must contain at least 32 characters");
   return secret;
 }
 
@@ -28,11 +28,11 @@ function port(value: string | undefined, name: string, fallback: number): number
   return parsed;
 }
 
-export function getMailConfig(env: MailSettingsEnv): MailConfig {
+export function getMailConfig(env: MailSettingsEnv, credentials: MailCredentials): MailConfig {
   return {
-    email: required(env.ICLOUD_EMAIL, "ICLOUD_EMAIL"),
-    imapUser: required(env.ICLOUD_IMAP_USER || env.ICLOUD_EMAIL, "ICLOUD_IMAP_USER"),
-    password: required(env.ICLOUD_APP_PASSWORD, "ICLOUD_APP_PASSWORD"),
+    email: required(credentials.email, "iCloud email"),
+    imapUser: required(credentials.imapUser, "iCloud IMAP username"),
+    password: required(credentials.appPassword, "iCloud app-specific password"),
     imapHost: env.IMAP_HOST || "imap.mail.me.com",
     imapPort: port(env.IMAP_PORT, "IMAP_PORT", 993),
     smtpHost: env.SMTP_HOST || "smtp.mail.me.com",

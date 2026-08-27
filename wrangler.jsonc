@@ -11,11 +11,19 @@
     "enabled": true,
     "head_sampling_rate": 1
   },
+  "secrets": {
+    "required": [
+      "MAIL_CREDENTIALS_ENCRYPTION_KEY"
+    ]
+  },
   "kv_namespaces": [
     {
       "binding": "OAUTH_KV",
-      // Deploy to Cloudflare provisions a namespace and replaces this placeholder.
-      "id": "00000000000000000000000000000000"
+      "id": "dd49a6cb6f1944c58c73fde5535142e3"
+    },
+    {
+      "binding": "MAIL_CREDENTIALS_KV",
+      "id": "f4dace26eb7c47ff98830679090a41e9"
     }
   ],
   "vars": {
