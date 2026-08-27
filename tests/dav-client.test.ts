@@ -141,6 +141,38 @@ describe("iCloud DAV reports and conditional writes", () => {
     expect(transcript.calls.at(-1)?.body).toContain("a.ics");
   });
 
+  it("serializes absolute CalDAV shard hrefs as escaped relative multiget hrefs", async () => {
+    const canonicalHref = "https://p122-caldav.icloud.com/calendars/a/event-a.ics?rev=1&part=2";
+    const responseHref = "https://p122-caldav.icloud.com/calendars/a/event-a.ics?rev=1&amp;part=2";
+    const queryResponse = `<d:multistatus xmlns:d="DAV:"><d:response><d:href>${responseHref}</d:href><d:propstat><d:prop><d:getetag>"event-a"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`;
+    const multigetResponse = `<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>${responseHref}</d:href><d:propstat><d:prop><d:getetag>"event-a"</d:getetag><c:calendar-data><![CDATA[${eventRaw}]]></c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`;
+    const transcript = new Transcript([response(queryResponse), response(multigetResponse)]);
+    const client = new DavClient(credentials, caldavConfig, transcript.fetch);
+
+    const page = await client.listCalendarItems({ calendarHref: "https://p122-caldav.icloud.com/calendars/a/", componentType: "VEVENT" }, undefined, 50);
+    const multigetBody = transcript.calls.at(-1)?.body;
+
+    expect(page.items[0]).toMatchObject({ href: canonicalHref, uid: "event-a", etag: '"event-a"' });
+    expect(multigetBody).toContain('<d:href>/calendars/a/event-a.ics?rev=1&amp;part=2</d:href>');
+    expect(multigetBody).not.toMatch(/<d:href>https:\/\//u);
+  });
+
+  it("serializes absolute CardDAV shard hrefs as escaped relative multiget hrefs", async () => {
+    const canonicalHref = "https://p122-contacts.icloud.com/addressbooks/a/contact-a.vcf?rev=1&part=2";
+    const responseHref = "https://p122-contacts.icloud.com/addressbooks/a/contact-a.vcf?rev=1&amp;part=2";
+    const queryResponse = `<d:multistatus xmlns:d="DAV:"><d:response><d:href>${responseHref}</d:href><d:propstat><d:prop><d:getetag>"contact-a"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`;
+    const multigetResponse = `<d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><d:response><d:href>${responseHref}</d:href><d:propstat><d:prop><d:getetag>"contact-a"</d:getetag><card:address-data><![CDATA[${contactRaw}]]></card:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`;
+    const transcript = new Transcript([response(queryResponse), response(multigetResponse)]);
+    const client = new DavClient(credentials, caldavConfig, transcript.fetch);
+
+    const page = await client.listContacts({ addressBookHref: "https://p122-contacts.icloud.com/addressbooks/a/" }, undefined, 50);
+    const multigetBody = transcript.calls.at(-1)?.body;
+
+    expect(page.items[0]).toMatchObject({ href: canonicalHref, uid: "contact-a", etag: '"contact-a"' });
+    expect(multigetBody).toContain('<d:href>/addressbooks/a/contact-a.vcf?rev=1&amp;part=2</d:href>');
+    expect(multigetBody).not.toMatch(/<d:href>https:\/\//u);
+  });
+
   it("uses an object-level filter for an unfiltered any-component query", async () => {
     const queryResponse = `<d:multistatus xmlns:d="DAV:"><d:response><d:href>/calendars/a/event.ics</d:href><d:propstat><d:prop><d:getetag>"event"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/calendars/a/todo.ics</d:href><d:propstat><d:prop><d:getetag>"todo"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`;
     const multigetResponse = `<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/calendars/a/event.ics</d:href><d:propstat><d:prop><d:getetag>"event"</d:getetag><c:calendar-data><![CDATA[${eventRaw}]]></c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/calendars/a/todo.ics</d:href><d:propstat><d:prop><d:getetag>"todo"</d:getetag><c:calendar-data><![CDATA[${"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:todo-a\r\nSUMMARY:Todo A\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"}]]></c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`;

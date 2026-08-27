@@ -303,6 +303,11 @@ function normalizeHref(value: string, base: URL, service: DavService): string {
   return href.toString();
 }
 
+function davRequestHref(value: string): string {
+  const href = new URL(value);
+  return `${href.pathname}${href.search}`;
+}
+
 function formatReportDate(value: string): string {
   const dateOnly = value.match(/^(\d{4})-(\d{2})-(\d{2})$/u);
   if (dateOnly && isUtcIsoDateOrDateTime(value)) return `${dateOnly[1]}${dateOnly[2]}${dateOnly[3]}T000000Z`;
@@ -699,7 +704,7 @@ export class DavClient {
     const groups = new Map<string, DavResourceRef[]>();
     for (const ref of refs) groups.set(ref.collectionHref, [...(groups.get(ref.collectionHref) ?? []), ref]);
     for (const [collectionHref, group] of groups) {
-      const { response, entries } = await this.report("calendar", new URL(collectionHref), calendarMultigetBody(group.map((ref) => ref.href)));
+      const { response, entries } = await this.report("calendar", new URL(collectionHref), calendarMultigetBody(group.map((ref) => davRequestHref(ref.href))));
       const base = new URL(response.url);
       for (const entry of entries) {
         const href = normalizeHref(entry.href, base, "calendar");
@@ -729,7 +734,7 @@ export class DavClient {
     const groups = new Map<string, DavResourceRef[]>();
     for (const ref of refs) groups.set(ref.collectionHref, [...(groups.get(ref.collectionHref) ?? []), ref]);
     for (const [collectionHref, group] of groups) {
-      const { response, entries } = await this.report("contacts", new URL(collectionHref), addressBookMultigetBody(group.map((ref) => ref.href)));
+      const { response, entries } = await this.report("contacts", new URL(collectionHref), addressBookMultigetBody(group.map((ref) => davRequestHref(ref.href))));
       const base = new URL(response.url);
       for (const entry of entries) {
         const href = normalizeHref(entry.href, base, "contacts");
