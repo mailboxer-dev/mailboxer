@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SmtpClient } from "../src/smtp/client";
+import { SMTP_SOCKET_OPTIONS, SmtpClient } from "../src/smtp/client";
 import type { MailConfig } from "../src/types";
 import { mixedChunks, TranscriptSocket } from "./helpers/transcript-socket";
 
@@ -14,6 +14,10 @@ const config: MailConfig = {
 };
 
 describe("transcript-backed SMTP socket", () => {
+  it("enables Cloudflare STARTTLS upgrades on the initial socket", () => {
+    expect(SMTP_SOCKET_OPTIONS).toEqual({ secureTransport: "starttls", allowHalfOpen: false });
+  });
+
   it("performs STARTTLS, authenticates, and dot-stuffs DATA", async () => {
     const socket = new TranscriptSocket(mixedChunks(
       "220 smtp.mail.me.com ESMTP ready\r\n",

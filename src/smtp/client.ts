@@ -12,12 +12,17 @@ import { containsAsciiControl } from "../security";
 
 const SMTP_TIMEOUT_MS = 30_000;
 
+export const SMTP_SOCKET_OPTIONS = {
+  secureTransport: "starttls",
+  allowHalfOpen: false,
+} as const;
+
 export type SmtpConnector = (config: MailConfig) => Promise<SocketLike>;
 
 async function defaultConnector(config: MailConfig): Promise<SocketLike> {
   const socket = connect(
     { hostname: config.smtpHost, port: config.smtpPort },
-    { secureTransport: "off", allowHalfOpen: false },
+    SMTP_SOCKET_OPTIONS,
   );
   if (socket.opened) await socket.opened;
   return socket;
