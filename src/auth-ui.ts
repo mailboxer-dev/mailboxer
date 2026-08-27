@@ -1,4 +1,5 @@
 export type AccountFormTarget = "start" | "add" | "edit";
+export type AccountFormStep = "email" | "password" | "config";
 export type AccountPreset = "icloud" | "custom";
 export type TlsMode = "implicit" | "starttls";
 
@@ -48,9 +49,9 @@ export type AuthPageModel =
       kind: "account-form";
       state: string;
       target: AccountFormTarget;
+      step: AccountFormStep;
       accountId?: string;
       account: AccountFormModel;
-      draftNotice: boolean;
     })
   | (AuthPageBase & {
       kind: "management";
@@ -95,7 +96,9 @@ export function renderAuthPage(page: AuthPageModel): string {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#062b66">
     <title>${escapeAttribute(page.title)}</title>
+    <link rel="icon" type="image/png" href="/favicon.png">
     <link rel="stylesheet" href="/style.css">
   </head>
   <body>

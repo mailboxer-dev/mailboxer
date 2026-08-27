@@ -17,8 +17,10 @@ const CREDENTIAL_KEY_PREFIX = "mail:credentials:v1:";
 const CREDENTIAL_ID_PREFIX = "icloud-";
 const CREDENTIAL_ID_PATTERN = /^icloud-[A-Za-z0-9_-]{43}$/u;
 const MAX_CREDENTIAL_RECORD_BYTES = 8 * 1024;
-const CREDENTIAL_ENCRYPTION_CONTEXT = "icloud-mail-mcp credential encryption v1\u0000";
-const CREDENTIAL_ID_CONTEXT = "icloud-mail-mcp credential id v1\u0000";
+// These legacy domain-separation values are part of persisted credential IDs
+// and ciphertext keys. Changing them would invalidate existing accounts.
+const LEGACY_CREDENTIAL_ENCRYPTION_CONTEXT = "icloud-mail-mcp credential encryption v1\u0000";
+const LEGACY_CREDENTIAL_ID_CONTEXT = "icloud-mail-mcp credential id v1\u0000";
 
 const credentialSubmissionSchema = z.object({
   email: z.string().trim().email().max(320),
@@ -104,7 +106,7 @@ function credentialsKv(env: Pick<AppEnv, "MAIL_CREDENTIALS_KV">): KVNamespace {
 }
 
 async function encryptionKey(secret: string): Promise<CryptoKey> {
-  const material = await sha256(`${CREDENTIAL_ENCRYPTION_CONTEXT}${secret}`);
+  const material = await sha256(`${LEGACY_CREDENTIAL_ENCRYPTION_CONTEXT}${secret}`);
   return crypto.subtle.importKey(
     "raw",
     asArrayBuffer(material),
@@ -115,7 +117,7 @@ async function encryptionKey(secret: string): Promise<CryptoKey> {
 }
 
 export async function credentialIdForEmail(email: string, secret: string): Promise<string> {
-  const digest = await sha256(`${CREDENTIAL_ID_CONTEXT}${secret}\u0000${normalizeEmail(email)}`);
+  const digest = await sha256(`${LEGACY_CREDENTIAL_ID_CONTEXT}${secret}\u0000${normalizeEmail(email)}`);
   return `${CREDENTIAL_ID_PREFIX}${base64UrlEncode(digest)}`;
 }
 

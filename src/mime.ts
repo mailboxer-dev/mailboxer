@@ -116,7 +116,7 @@ function bodyPart(contentType: string, content: string, boundary?: string): stri
 }
 
 function createBoundary(prefix: string): string {
-  return `----icloud-mail-mcp-${prefix}-${crypto.randomUUID()}`;
+  return `----mailboxer-${prefix}-${crypto.randomUUID()}`;
 }
 
 function composeBody(input: ComposeInput): string {

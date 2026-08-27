@@ -286,7 +286,7 @@ export function serializeContact(input: ContactInput): string {
   const contactName = input.name ?? {};
   const formattedName = input.formattedName ?? [contactName.given, contactName.family].filter(Boolean).join(" ");
   if (!formattedName) throw new VcardParseError("formattedName or a name is required");
-  const lines = ["BEGIN:VCARD", "VERSION:3.0", "PRODID:-//icloud-mail-mcp//EN"];
+  const lines = ["BEGIN:VCARD", "VERSION:3.0", "PRODID:-//mailboxer//EN"];
   addLine(lines, "UID", escapeValue(uid));
   addLine(lines, "FN", escapeValue(formattedName));
   addLine(lines, "N", [contactName.family, contactName.given, contactName.additional, contactName.prefix, contactName.suffix]

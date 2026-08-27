@@ -4,6 +4,7 @@ import {
   addDraftAccount,
   commitAccountDraft,
   findAccountDraft,
+  findAccountDraftByEmail,
   loadAccountDraft,
   loadAccountVault,
   newAccountDraft,
@@ -72,6 +73,17 @@ describe("multi-account vault", () => {
     await expect(findAccountDraft(env(), account("new"))).resolves.toBeNull();
   });
 
+  it("finds a committed draft by normalized email before credentials are supplied", async () => {
+    const environment = env();
+    const vault = await commitAccountDraft(environment, newAccountDraft(account("saved")));
+
+    await expect(findAccountDraftByEmail(environment, "  SAVED@EXAMPLE.COM  ")).resolves.toMatchObject({
+      userId: vault.userId,
+      baseRevision: vault.revision,
+      defaultAccountId: vault.defaultAccountId,
+    });
+  });
+
   it("encrypts drafts and vaults, routes by default or explicit account, and returns safe summaries", async () => {
     const kv = new MemoryKv();
     const environment = env(kv);
@@ -109,6 +121,43 @@ describe("multi-account vault", () => {
       defaultAccountId: firstVault.defaultAccountId,
       accounts: firstVault.accounts,
     }, firstVault.defaultAccountId)).toThrow(/final account/u);
+  });
+
+  it("rejects email ownership conflicts and removes email indexes for deleted accounts", async () => {
+    const kv = new MemoryKv();
+    const environment = env(kv);
+    const removed = account("removed");
+    const retained = account("retained");
+    const initialDraft = addDraftAccount(newAccountDraft(removed), retained);
+    const firstVault = await commitAccountDraft(environment, initialDraft);
+    expect([...kv.values.keys()].filter((key) => key.startsWith("mail:account-email-index:v2:")).length).toBe(2);
+
+    const remainingDraft = removeDraftAccount({
+      userId: firstVault.userId,
+      baseRevision: firstVault.revision,
+      defaultAccountId: firstVault.defaultAccountId,
+      accounts: firstVault.accounts,
+    }, removed.accountId);
+    await commitAccountDraft(environment, remainingDraft);
+
+    await expect(findAccountDraftByEmail(environment, removed.address)).resolves.toBeNull();
+    await expect(findAccountDraftByEmail(environment, retained.address)).resolves.toMatchObject({ userId: firstVault.userId });
+    expect([...kv.values.keys()].filter((key) => key.startsWith("mail:account-email-index:v2:")).length).toBe(1);
+
+    const duplicate = {
+      ...account("duplicate"),
+      address: retained.address,
+      config: { ...account("duplicate").config, email: retained.address },
+    };
+    await expect(commitAccountDraft(environment, newAccountDraft(duplicate))).rejects.toThrow(/already attached/u);
+
+    const sameAddress = {
+      ...account("same-address"),
+      address: retained.address,
+      config: { ...account("same-address").config, email: retained.address },
+    };
+    await expect(commitAccountDraft(environment, addDraftAccount(newAccountDraft(retained), sameAddress)))
+      .rejects.toThrow(/invalid account list/u);
   });
 
   it("rejects unknown accounts and unavailable capabilities without exposing configuration", async () => {
@@ -172,5 +221,23 @@ describe("multi-account vault", () => {
     const migrated = await commitAccountDraft(environment, draft);
     expect(migrated.userId).toBe(legacyId);
     expect(await loadAccountVault(environment, legacyId)).toEqual(migrated);
+  });
+
+  it("finds a legacy iCloud record by normalized email", async () => {
+    const environment = env();
+    const legacyId = await storeMailCredentials(environment, {
+      email: "legacy@icloud.com",
+      imapUser: "legacy",
+      appPassword: "app-password",
+    });
+
+    await expect(findAccountDraftByEmail(environment, " LEGACY@ICLOUD.COM ")).resolves.toMatchObject({
+      userId: legacyId,
+      baseRevision: null,
+    });
+  });
+
+  it("returns no draft for an unknown email", async () => {
+    await expect(findAccountDraftByEmail(env(), "unknown@example.com")).resolves.toBeNull();
   });
 });

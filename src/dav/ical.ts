@@ -309,7 +309,7 @@ function validateRrule(value: string): string {
 export function serializeCalendarItem(input: CalendarItemInput, now = new Date()): string {
   if (input.componentType !== "VEVENT" && input.componentType !== "VTODO") throw new IcalendarParseError("Unsupported calendar component type");
   const uid = safeValue(input.uid ?? crypto.randomUUID(), "UID");
-  const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//icloud-mail-mcp//EN", `BEGIN:${input.componentType}`];
+  const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//mailboxer//EN", `BEGIN:${input.componentType}`];
   lines.push(propertyLine("UID", escapeText(uid)), propertyLine("DTSTAMP", utcStamp(now)));
   if (input.start !== undefined) {
     const allDay = input.allDay === true || isIsoDate(input.start);

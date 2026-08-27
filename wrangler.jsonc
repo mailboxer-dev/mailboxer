@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "icloud-mail-mcp",
+  "name": "mailboxer",
   "main": "src/index.ts",
   "assets": {
     "directory": "./dist/ui"
@@ -9,7 +9,7 @@
     "command": "npm run build:ui",
     "watch_dir": [
       "ui",
-      "src/auth-ui.ts",
+      "src",
       "vite.config.ts"
     ]
   },

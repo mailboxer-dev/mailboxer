@@ -139,6 +139,19 @@ function initialAccountForm(state: string, cookie: string | undefined): Request 
   });
 }
 
+function lookupForm(state: string, cookie: string | undefined, address = "primary@icloud.com", target = "start"): Request {
+  return post(state, cookie, { action: "lookup", target, address });
+}
+
+function unlockForm(state: string, cookie: string | undefined, accountId: string, password = "app-password"): Request {
+  return post(state, cookie, {
+    action: "unlock",
+    target: "start",
+    account_id: accountId,
+    account_password: password,
+  });
+}
+
 const context = {} as ExecutionContext;
 
 describe("multi-account OAuth authorization", () => {
@@ -167,17 +180,31 @@ describe("multi-account OAuth authorization", () => {
     const model = decodeAuthPageModel(encoded);
     expect(model.kind).toBe("account-form");
     if (model.kind === "account-form") {
+      expect(model.step).toBe("email");
       expect(model.account.preset).toBe("icloud");
       expect(model.account.address).toBe("");
     }
     expect(response.headers.get("Content-Security-Policy")).toContain("script-src 'self'");
     const initialCsp = response.headers.get("Content-Security-Policy") ?? "";
+    expect(initialCsp).toContain("img-src 'self'");
     expect(initialCsp).toContain("form-action 'self' http://127.0.0.1:6274");
     expect(initialCsp).not.toContain("/callback");
     expect(initialCsp).not.toContain("tenant=one");
     expect(response.headers.get("Set-Cookie")).toContain("HttpOnly");
     expect(response.headers.get("Set-Cookie")).toContain("Path=/authorize");
     expect(oauthKv.values.size).toBe(1);
+  });
+
+  it("omits CSP only for local HTTP development origins", async () => {
+    const authFetch = authFetchFor();
+    const local = await authFetch(new Request("http://localhost:8787/authorize"), oauthEnv(), context);
+    expect(local.headers.get("Content-Security-Policy")).toBeNull();
+
+    for (const url of ["https://localhost/authorize", "http://localhost.example/authorize", "https://mcp.example/authorize"]) {
+      const response = await authFetch(new Request(url), oauthEnv(), context);
+      expect(response.headers.get("Content-Security-Policy")).toContain("default-src 'none'");
+      expect(response.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
+    }
   });
 
   it("rejects an unbound cross-site POST but accepts the same-origin cookie fallback", async () => {
@@ -188,15 +215,31 @@ describe("multi-account OAuth authorization", () => {
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state } = stateAndCookie(authorize);
 
-    const sameOrigin = initialAccountForm(state, undefined);
+    const sameOrigin = lookupForm(state, undefined);
     sameOrigin.headers.set("Origin", "https://mcp.example");
     expect((await authFetch(sameOrigin, environment, context)).status).toBe(200);
 
     const second = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const secondState = stateAndCookie(second).state;
-    const crossSite = initialAccountForm(secondState, undefined);
+    const crossSite = lookupForm(secondState, undefined);
     crossSite.headers.set("Origin", "https://attacker.example");
     expect((await authFetch(crossSite, environment, context)).status).toBe(400);
+  });
+
+  it("shows account settings only after checking a new email and detects its provider", async () => {
+    const environment = oauthEnv();
+    const authFetch = authFetchFor();
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
+    const { state, cookie } = stateAndCookie(authorize);
+
+    const response = await authFetch(lookupForm(state, cookie, "person@example.com"), environment, context);
+    const model = await pageModel(response);
+    expect(model.kind).toBe("account-form");
+    if (model.kind === "account-form") {
+      expect(model.step).toBe("config");
+      expect(model.account.address).toBe("person@example.com");
+      expect(model.account.preset).toBe("custom");
+    }
   });
 
   it("creates an encrypted draft, commits it on Continue, and issues opaque v2 props", async () => {
@@ -208,6 +251,11 @@ describe("multi-account OAuth authorization", () => {
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
 
+    const details = await authFetch(lookupForm(state, cookie), environment, context);
+    const detailsPage = await pageModel(details);
+    expect(detailsPage.kind).toBe("account-form");
+    if (detailsPage.kind === "account-form") expect(detailsPage.step).toBe("config");
+
     const verified = await authFetch(initialAccountForm(state, cookie), environment, context);
     expect(verified.status).toBe(200);
     const managementCsp = verified.headers.get("Content-Security-Policy") ?? "";
@@ -216,7 +264,7 @@ describe("multi-account OAuth authorization", () => {
     expect(managementCsp).not.toContain("tenant=one");
     const verifiedPage = await pageModel(verified);
     expect(verifiedPage.kind).toBe("management");
-    expect(verifiedPage.message?.text).toContain("New profile ready");
+    expect(verifiedPage.message?.text).toContain("Account added");
     expect([...credentialsKv.values.values()].join("\n")).not.toContain("app-password");
 
     const response = await authFetch(post(state, cookie, { action: "continue" }, ["mail.read", "offline_access"]), environment, context);
@@ -232,23 +280,88 @@ describe("multi-account OAuth authorization", () => {
     expect(oauthKv.values.size).toBe(0);
   });
 
-  it("unlocks an existing profile by verifying any configured live account", async () => {
+  it("unlocks an existing profile by matching the saved password without live verification", async () => {
     const oauthKv = new MemoryKv();
     const credentialsKv = new MemoryKv();
     const environment = oauthEnv({ oauthKv, credentialsKv });
     const vault = await commitAccountDraft(environment, newAccountDraft(account()));
-    const verifiedAccount = { ...account(), accountId: "acct_zzzzzzzzzzzzzzzzzzzzzz" };
-    const authFetch = authFetchFor({ verifyAccountSubmission: vi.fn(async () => verifiedAccount) });
+    const verify = vi.fn(async () => account());
+    const authFetch = authFetchFor({ verifyAccountSubmission: verify });
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
-    const response = await authFetch(initialAccountForm(state, cookie), environment, context);
+    const passwordResponse = await authFetch(lookupForm(state, cookie), environment, context);
+    const passwordPage = await pageModel(passwordResponse);
+    expect(passwordPage.kind).toBe("account-form");
+    if (passwordPage.kind === "account-form") {
+      expect(passwordPage.step).toBe("password");
+      expect(passwordPage.accountId).toBe(vault.defaultAccountId);
+      expect(passwordPage.account.address).toBe("primary@icloud.com");
+      expect(JSON.stringify(passwordPage)).not.toContain("imap.mail.me.com");
+      expect(JSON.stringify(passwordPage)).not.toContain("smtp.mail.me.com");
+      expect(JSON.stringify(passwordPage)).not.toContain("app-password");
+    }
+    expect(verify).not.toHaveBeenCalled();
+
+    const response = await authFetch(unlockForm(state, cookie, vault.defaultAccountId), environment, context);
     const model = await pageModel(response);
     expect(response.status).toBe(200);
     expect(model.kind).toBe("management");
     if (model.kind === "management") expect(model.accounts[0]?.label).toBe("Personal");
-    expect(model.message?.text).toContain("Existing profile found");
-    expect(model.title).toBe("Manage Email MCP accounts");
+    expect(model.message?.text).toContain("signed in");
+    expect(model.title).toBe("Your accounts");
+    expect(verify).not.toHaveBeenCalled();
     expect(JSON.stringify(model)).not.toContain(vault.userId);
+  });
+
+  it("rejects a wrong saved password without live verification", async () => {
+    const credentialsKv = new MemoryKv();
+    const environment = oauthEnv({ credentialsKv });
+    const vault = await commitAccountDraft(environment, newAccountDraft(account()));
+    const verify = vi.fn(async () => account());
+    const authFetch = authFetchFor({ verifyAccountSubmission: verify });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
+    const { state, cookie } = stateAndCookie(authorize);
+    await authFetch(lookupForm(state, cookie), environment, context);
+
+    const response = await authFetch(unlockForm(state, cookie, vault.defaultAccountId, "wrong-password"), environment, context);
+    expect(response.status).toBe(401);
+    expect((await pageModel(response)).message?.text).toContain("password didn't work");
+    expect(verify).not.toHaveBeenCalled();
+  });
+
+  it("reuses the saved iCloud password while live-verifying an account edit", async () => {
+    const credentialsKv = new MemoryKv();
+    const environment = oauthEnv({ credentialsKv });
+    const vault = await commitAccountDraft(environment, newAccountDraft(account()));
+    const verify = vi.fn(async (_env, submission) => ({
+      ...account(),
+      accountId: vault.defaultAccountId,
+      label: submission.label,
+    }));
+    const authFetch = authFetchFor({ verifyAccountSubmission: verify });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
+    const { state, cookie } = stateAndCookie(authorize);
+    await authFetch(lookupForm(state, cookie), environment, context);
+    await authFetch(unlockForm(state, cookie, vault.defaultAccountId), environment, context);
+    await authFetch(post(state, cookie, { action: "edit", account_id: vault.defaultAccountId }), environment, context);
+
+    const response = await authFetch(post(state, cookie, {
+      action: "verify",
+      target: "edit",
+      account_id: vault.defaultAccountId,
+      preset: "icloud",
+      label: "Renamed",
+      address: "primary@icloud.com",
+      service_options_present: "1",
+      enable_mail: "1",
+    }), environment, context);
+
+    expect(response.status).toBe(200);
+    expect(verify).toHaveBeenCalledOnce();
+    expect(verify.mock.calls[0]?.[1].appPassword).toBe("app-password");
+    const model = await pageModel(response);
+    expect(model.kind).toBe("management");
+    if (model.kind === "management") expect(model.accounts[0]?.label).toBe("Renamed");
   });
 
   it("returns a generic verification error and enforces the five-attempt limit", async () => {
@@ -258,10 +371,11 @@ describe("multi-account OAuth authorization", () => {
     });
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
+    await authFetch(lookupForm(state, cookie), environment, context);
     for (let attempt = 1; attempt <= 4; attempt += 1) {
       const response = await authFetch(initialAccountForm(state, cookie), environment, context);
       expect(response.status).toBe(401);
-      expect((await pageModel(response)).message?.text).toContain("could not be verified");
+      expect((await pageModel(response)).message?.text).toContain("couldn't sign in");
     }
     const final = await authFetch(initialAccountForm(state, cookie), environment, context);
     expect(final.status).toBe(401);
@@ -276,6 +390,7 @@ describe("multi-account OAuth authorization", () => {
     const authFetch = authFetchFor({ verifyAccountSubmission: vi.fn(async () => account()) });
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
+    await authFetch(lookupForm(state, cookie), environment, context);
     await authFetch(initialAccountForm(state, cookie), environment, context);
     const denied = await authFetch(post(state, cookie, { decision: "deny" }, []), environment, context);
     expect(denied.status).toBe(302);

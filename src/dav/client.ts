@@ -468,7 +468,7 @@ export class DavClient {
             Accept: "application/xml, text/calendar, text/vcard, text/*;q=0.8",
             Authorization: this.authHeader,
             "Cache-Control": "no-store",
-            "User-Agent": "icloud-mail-mcp/0.1",
+            "User-Agent": "mailboxer/0.1",
             ...options.headers,
           });
           const response = await this.fetcher(url, {

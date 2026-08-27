@@ -23,9 +23,11 @@ import type {
 
 const VAULT_KEY_PREFIX = "mail:account-vault:v2:";
 const INDEX_KEY_PREFIX = "mail:account-index:v2:";
+const EMAIL_INDEX_KEY_PREFIX = "mail:account-email-index:v2:";
 const DRAFT_KEY_PREFIX = "mail:account-draft:v2:";
 const VAULT_CONTEXT = "email-mcp account vault v2\u0000";
 const INDEX_CONTEXT = "email-mcp account locator v2\u0000";
+const EMAIL_INDEX_CONTEXT = "email-mcp account email index v2\u0000";
 const MAX_VAULT_BYTES = 96 * 1024;
 const MAX_ACCOUNTS = 10;
 export const ACCOUNT_DRAFT_TTL_SECONDS = 10 * 60;
@@ -343,7 +345,7 @@ function canonicalLocator(account: Pick<StoredMailAccount, "preset" | "address" 
     : `custom\u0000${account.config.imapHost.toLowerCase()}\u0000${account.config.imapUser.trim().toLowerCase()}`;
 }
 
-async function locatorDigest(locator: string, secret: string): Promise<string> {
+async function indexDigest(value: string, context: string, secret: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     "raw",
     asArrayBuffer(bytes(secret)),
@@ -351,20 +353,29 @@ async function locatorDigest(locator: string, secret: string): Promise<string> {
     false,
     ["sign"],
   );
-  const signature = await crypto.subtle.sign("HMAC", key, asArrayBuffer(bytes(`${INDEX_CONTEXT}${locator}`)));
+  const signature = await crypto.subtle.sign("HMAC", key, asArrayBuffer(bytes(`${context}${value}`)));
   return base64UrlEncode(new Uint8Array(signature));
 }
 
+async function locatorIndexKey(locator: string, secret: string): Promise<string> {
+  return `${INDEX_KEY_PREFIX}${await indexDigest(locator, INDEX_CONTEXT, secret)}`;
+}
+
 async function indexKey(account: StoredMailAccount, secret: string): Promise<string> {
-  return `${INDEX_KEY_PREFIX}${await locatorDigest(canonicalLocator(account), secret)}`;
+  return locatorIndexKey(canonicalLocator(account), secret);
+}
+
+async function emailIndexKey(email: string, secret: string): Promise<string> {
+  return `${EMAIL_INDEX_KEY_PREFIX}${await indexDigest(normalizeAddress(email), EMAIL_INDEX_CONTEXT, secret)}`;
 }
 
 function validateVault(vault: AccountVaultV2): AccountVaultV2 {
   const parsed = vaultSchema.parse(vault);
   const ids = new Set(parsed.accounts.map((account) => account.accountId));
   const locators = new Set(parsed.accounts.map(canonicalLocator));
-  if (ids.size !== parsed.accounts.length || locators.size !== parsed.accounts.length || !ids.has(parsed.defaultAccountId)) {
-    throw new AccountVaultError("Account vault has an invalid default account");
+  const addresses = new Set(parsed.accounts.map((account) => normalizeAddress(account.address)));
+  if (ids.size !== parsed.accounts.length || locators.size !== parsed.accounts.length || addresses.size !== parsed.accounts.length || !ids.has(parsed.defaultAccountId)) {
+    throw new AccountVaultError("Account vault has an invalid account list or default account");
   }
   return parsed;
 }
@@ -401,6 +412,64 @@ export async function deleteAccountDraft(env: AppEnv, state: string): Promise<vo
   await env.MAIL_CREDENTIALS_KV.delete(`${DRAFT_KEY_PREFIX}${state}`);
 }
 
+function draftFromVault(vault: AccountVaultV2): AccountDraft {
+  return {
+    userId: vault.userId,
+    baseRevision: vault.revision,
+    defaultAccountId: vault.defaultAccountId,
+    accounts: vault.accounts,
+  };
+}
+
+async function loadDraftForOwner(env: AppEnv, owner: string): Promise<AccountDraft> {
+  const vault = await loadAccountVault(env, owner);
+  if (!vault) throw new AccountVaultError("The account profile could not be unlocked");
+  return draftFromVault(vault);
+}
+
+async function loadLegacyAccountDraftByEmail(env: AppEnv, email: string, secret: string): Promise<AccountDraft | null> {
+  const legacyId = await credentialIdForEmail(email, secret);
+  try {
+    const credentials = await loadMailCredentials(env, legacyId);
+    const account = storedAccountSchema.parse({
+      accountId: randomId("acct_"),
+      label: "iCloud",
+      preset: "icloud",
+      address: normalizeAddress(credentials.email),
+      capabilities: { mail: true, calendar: true, contacts: true },
+      config: getMailConfig(env, credentials),
+    });
+    return {
+      userId: legacyId,
+      baseRevision: null,
+      defaultAccountId: account.accountId,
+      accounts: [account],
+    };
+  } catch (error) {
+    if (!(error instanceof MailCredentialError)) throw error;
+    return null;
+  }
+}
+
+export async function findAccountDraftByEmail(env: AppEnv, email: string): Promise<AccountDraft | null> {
+  const parsedEmail = z.string().trim().email().max(320).safeParse(email);
+  if (!parsedEmail.success) return null;
+  const normalizedEmail = normalizeAddress(parsedEmail.data);
+  const secret = getCredentialsEncryptionSecret(env);
+
+  const owner = await env.MAIL_CREDENTIALS_KV.get(await emailIndexKey(normalizedEmail, secret));
+  if (owner) return loadDraftForOwner(env, owner);
+
+  // Older v2 iCloud accounts only have the locator index, which is also email-based.
+  const legacyLocatorOwner = await env.MAIL_CREDENTIALS_KV.get(
+    await locatorIndexKey(`icloud\u0000${normalizedEmail}`, secret),
+  );
+  if (legacyLocatorOwner) return loadDraftForOwner(env, legacyLocatorOwner);
+
+  // Before account vaults existed, iCloud credentials were keyed by a digest of the email.
+  return loadLegacyAccountDraftByEmail(env, normalizedEmail, secret);
+}
+
 export async function commitAccountDraft(env: AppEnv, draft: AccountDraft): Promise<AccountVaultV2> {
   return withSpan("mail.accounts.commit", { "mail.accounts.count": draft.accounts.length }, async () => {
     const parsed = draftSchema.parse(draft);
@@ -416,7 +485,9 @@ export async function commitAccountDraft(env: AppEnv, draft: AccountDraft): Prom
       accounts: parsed.accounts,
     });
     const secret = getCredentialsEncryptionSecret(env);
-    const nextKeys = await Promise.all(vault.accounts.map((account) => indexKey(account, secret)));
+    const nextLocatorKeys = await Promise.all(vault.accounts.map((account) => indexKey(account, secret)));
+    const nextEmailKeys = [...new Set(await Promise.all(vault.accounts.map((account) => emailIndexKey(account.address, secret))))];
+    const nextKeys = [...new Set([...nextLocatorKeys, ...nextEmailKeys])];
     for (const key of nextKeys) {
       const owner = await env.MAIL_CREDENTIALS_KV.get(key);
       if (owner && owner !== vault.userId) throw new AccountVaultError("This upstream account is already attached to another profile");
@@ -425,7 +496,9 @@ export async function commitAccountDraft(env: AppEnv, draft: AccountDraft): Prom
     await env.MAIL_CREDENTIALS_KV.put(vaultKey, await encryptRecord(vault, vaultKey, secret));
     await Promise.all(nextKeys.map((key) => env.MAIL_CREDENTIALS_KV.put(key, vault.userId)));
     if (existing) {
-      const oldKeys = await Promise.all(existing.accounts.map((account) => indexKey(account, secret)));
+      const oldLocatorKeys = await Promise.all(existing.accounts.map((account) => indexKey(account, secret)));
+      const oldEmailKeys = [...new Set(await Promise.all(existing.accounts.map((account) => emailIndexKey(account.address, secret))))];
+      const oldKeys = [...new Set([...oldLocatorKeys, ...oldEmailKeys])];
       await Promise.all(oldKeys.filter((key) => !nextKeys.includes(key)).map((key) => env.MAIL_CREDENTIALS_KV.delete(key)));
     }
     return vault;
@@ -436,14 +509,7 @@ export async function findAccountDraft(env: AppEnv, verifiedAccount: StoredMailA
   const secret = getCredentialsEncryptionSecret(env);
   const owner = await env.MAIL_CREDENTIALS_KV.get(await indexKey(verifiedAccount, secret));
   if (owner) {
-    const vault = await loadAccountVault(env, owner);
-    if (!vault) throw new AccountVaultError("The account profile could not be unlocked");
-    return {
-      userId: vault.userId,
-      baseRevision: vault.revision,
-      defaultAccountId: vault.defaultAccountId,
-      accounts: vault.accounts,
-    };
+    return loadDraftForOwner(env, owner);
   }
   if (verifiedAccount.preset === "icloud") {
     const legacyId = await credentialIdForEmail(verifiedAccount.address, secret);

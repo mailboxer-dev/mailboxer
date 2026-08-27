@@ -1,20 +1,21 @@
-import { StrictMode, useRef, useState, type FormEvent } from "react";
+import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   CalendarDays,
   Cloud,
   ContactRound,
+  Info,
   Mail,
+  Pencil,
   Plus,
   Server,
-  ShieldCheck,
+  Trash2,
 } from "lucide-react";
 import type {
-  AccountPreset,
   AuthPageModel,
   TlsMode,
 } from "../src/auth-ui";
-import { decodeAuthPageModel, detectAccountPreset } from "../src/auth-ui";
+import { decodeAuthPageModel } from "../src/auth-ui";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -35,7 +36,6 @@ import {
   FieldLabel,
   FieldLegend,
   FieldSet,
-  FieldTitle,
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import {
@@ -53,11 +53,11 @@ import "./styles.css";
 const previewModel: AuthPageModel = {
   version: 1,
   kind: "account-form",
-  title: "Connect Email MCP",
+  title: "Connect mailboxer",
   clientName: "ChatGPT",
   state: "preview-state",
   target: "start",
-  draftNotice: false,
+  step: "email",
   account: {
     preset: "icloud",
     label: "Personal",
@@ -72,33 +72,40 @@ function Hidden({ name, value }: { name: string; value: string }) {
   return <input type="hidden" name={name} value={value} />;
 }
 
+function ApplePasswordHelp({ includeWarning = false }: { includeWarning?: boolean }) {
+  return (
+    <>
+      Use an <a href="https://support.apple.com/102654" target="_blank" rel="noreferrer" className="font-medium text-foreground underline underline-offset-4">app-specific password</a> from your Apple Account{includeWarning ? ", not your usual Apple password" : ""}.
+    </>
+  );
+}
+
 function PageFrame({ page, children }: { page: AuthPageModel; children: React.ReactNode }) {
+  const description = page.kind === "management"
+    ? "Review your accounts, make any changes, then save when you're done."
+    : page.step === "email"
+      ? "Start with the email address you want to connect."
+      : page.step === "password"
+        ? `Enter the password for ${page.account.address} to open your saved accounts.`
+        : page.target === "edit"
+          ? `Update the settings for ${page.account.address}.`
+          : `Finish setting up ${page.account.address}.`;
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-3xl items-center px-4 py-8 sm:px-6 sm:py-12">
       <div className="w-full">
-        <div className="mb-6 flex items-center gap-3 px-1">
-          <div className="flex size-10 items-center justify-center rounded-xl bg-primary text-primary-foreground">
-            <Mail aria-hidden="true" className="size-5" />
-          </div>
-          <div>
-            <p className="text-sm font-medium">Email MCP</p>
-            <p className="text-sm text-muted-foreground">Secure account connection</p>
-          </div>
-        </div>
+        <header className="mb-6 px-1">
+          <img src="/mailboxer-logo.png" alt="mailboxer" className="h-10 w-auto shrink-0" />
+        </header>
         <Card className="shadow-sm">
           <CardHeader className="border-b">
             <CardTitle className="text-2xl tracking-tight sm:text-3xl">{page.title}</CardTitle>
-            <CardDescription className="text-base">
-              {page.kind === "account-form"
-                ? "Choose the email account to connect. We'll detect its provider and verify the connection."
-                : <><strong className="font-medium text-foreground">{page.clientName || "MCP client"}</strong> will use the accounts you connect here.</>}
-            </CardDescription>
+            <CardDescription className="text-base">{description}</CardDescription>
           </CardHeader>
-          <CardContent className="pt-6">
-            {page.message ? (
+          <CardContent>
+            {page.message?.kind === "error" ? (
               <Alert className="mb-6">
-                <ShieldCheck aria-hidden="true" />
-                <AlertTitle>{page.message.kind === "error" ? "Connection issue" : "Account updated"}</AlertTitle>
+                <Info aria-hidden="true" />
+                <AlertTitle>We couldn't continue</AlertTitle>
                 <AlertDescription>{page.message.text}</AlertDescription>
               </Alert>
             ) : null}
@@ -106,7 +113,7 @@ function PageFrame({ page, children }: { page: AuthPageModel; children: React.Re
           </CardContent>
         </Card>
         <p className="mt-4 px-1 text-center text-xs leading-relaxed text-muted-foreground">
-          Credentials are encrypted. Message, calendar, and contact content is fetched live and is never stored by this Worker.
+          Your sign-in details are encrypted. Your email, calendars, and contacts are read only when you ask for them.
         </p>
       </div>
     </main>
@@ -137,19 +144,25 @@ function ServiceSwitch({
   );
 }
 
-function TlsSelect({ name, value, onChange, service }: { name: string; value: TlsMode; onChange: (value: TlsMode) => void; service: "IMAP" | "SMTP" }) {
+const SECURITY_OPTIONS = [
+  { value: "implicit", label: "Encrypted from the start" },
+  { value: "starttls", label: "Connect first, then encrypt" },
+] as const;
+
+function SecuritySelect({ name, value, onChange, direction }: { name: string; value: TlsMode; onChange: (value: TlsMode) => void; direction: "incoming" | "outgoing" }) {
   return (
     <Field>
-      <FieldLabel>{service} security</FieldLabel>
+      <FieldLabel>Connection security</FieldLabel>
       <Hidden name={name} value={value} />
-      <Select value={value} onValueChange={(next) => onChange(next as TlsMode)}>
-        <SelectTrigger className="w-full" aria-label={`${service} security`}>
+      <Select items={SECURITY_OPTIONS} value={value} onValueChange={(next) => onChange(next as TlsMode)}>
+        <SelectTrigger className="w-full" aria-label={`${direction} mail connection security`}>
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
           <SelectGroup>
-            <SelectItem value="implicit">Implicit TLS ({service === "IMAP" ? "993" : "465"})</SelectItem>
-            <SelectItem value="starttls">STARTTLS ({service === "IMAP" ? "143" : "587 or 2525"})</SelectItem>
+            {SECURITY_OPTIONS.map((option) => (
+              <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+            ))}
           </SelectGroup>
         </SelectContent>
       </Select>
@@ -158,109 +171,76 @@ function TlsSelect({ name, value, onChange, service }: { name: string; value: Tl
 }
 
 function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-form" }> }) {
-  const [address, setAddress] = useState(page.account.address);
-  const [stage, setStage] = useState<"email" | "details">(
-    page.target === "edit" || Boolean(page.account.address) ? "details" : "email",
-  );
-  const [preset, setPreset] = useState(page.account.address ? page.account.preset : "custom");
   const [mail, setMail] = useState(page.account.services.mail);
   const [calendar, setCalendar] = useState(page.account.services.calendar);
   const [contacts, setContacts] = useState(page.account.services.contacts);
   const [sameSmtp, setSameSmtp] = useState(page.account.smtp.sameCredentials);
   const [imapTls, setImapTls] = useState(page.account.imap.tlsMode);
   const [smtpTls, setSmtpTls] = useState(page.account.smtp.tlsMode);
-  const emailInput = useRef<HTMLInputElement>(null);
-  const isCustom = preset === "custom";
-
-  function chooseProvider(next: AccountPreset) {
-    setPreset(next);
-    if (next === "custom") {
-      setMail(true);
-      setCalendar(false);
-      setContacts(false);
-    } else if (preset === "custom") {
-      setMail(page.account.services.mail);
-      setCalendar(page.account.services.calendar);
-      setContacts(page.account.services.contacts);
-    }
-  }
-
-  function continueFromEmail() {
-    if (!emailInput.current?.reportValidity()) return;
-    chooseProvider(detectAccountPreset(address));
-    setStage("details");
-  }
-
-  function submitAccountForm(event: FormEvent<HTMLFormElement>) {
-    if (stage !== "email") return;
-    const submitter = (event.nativeEvent as SubmitEvent).submitter;
-    if (submitter instanceof HTMLButtonElement && submitter.name === "decision") return;
-    event.preventDefault();
-    continueFromEmail();
-  }
-
-  const defaultLabel = page.account.label || (preset === "icloud" ? "iCloud" : address.split("@")[0] || "Email");
+  const [editingAppPassword, setEditingAppPassword] = useState(page.target !== "edit");
+  const [appPassword, setAppPassword] = useState("");
+  const isCustom = page.account.preset === "custom";
+  const defaultLabel = page.account.label || (isCustom ? page.account.address.split("@")[0] || "Email" : "iCloud");
 
   return (
     <PageFrame page={page}>
-      <form
-        method="post"
-        action="/authorize"
-        onSubmit={submitAccountForm}
-      >
+      <form method="post" action="/authorize">
         <Hidden name="authorization_state" value={page.state} />
-        {stage === "email" ? (
+        <Hidden name="target" value={page.target} />
+        {page.step === "email" ? (
           <>
-            <FieldGroup>
+            <FieldGroup className="gap-4">
               <Field>
-                <FieldLabel htmlFor="email-discovery">What email would you like to configure?</FieldLabel>
+                <FieldLabel htmlFor="email-discovery">Email address</FieldLabel>
                 <Input
-                  ref={emailInput}
                   id="email-discovery"
+                  name="address"
                   type="email"
                   autoComplete="username"
                   maxLength={320}
-                  value={address}
-                  onChange={(event) => setAddress(event.target.value)}
+                  defaultValue={page.account.address}
                   placeholder="you@example.com"
                   autoFocus
                   required
                 />
-                <FieldDescription>We'll detect iCloud automatically. Other addresses use custom IMAP and SMTP settings.</FieldDescription>
+                <FieldDescription>
+                  Already connected an account? Enter that email address first to open your saved account list.
+                </FieldDescription>
               </Field>
             </FieldGroup>
-            <div className="mt-8 flex flex-col-reverse gap-3 border-t pt-5 sm:flex-row sm:justify-between">
+            <div className="mt-6 flex flex-col-reverse gap-3 border-t pt-4 sm:flex-row sm:justify-between">
               <Button type="submit" name="decision" value="deny" variant="ghost">Cancel</Button>
-              <Button type="submit" size="lg">Continue</Button>
+              <Button type="submit" name="action" value="lookup" size="lg">Continue</Button>
+            </div>
+          </>
+        ) : page.step === "password" ? (
+          <>
+            <Hidden name="account_id" value={page.accountId ?? ""} />
+            <Hidden name="address" value={page.account.address} />
+            <FieldGroup className="gap-4">
+              <Field>
+                <FieldLabel htmlFor="account_password">Password</FieldLabel>
+                <Input id="account_password" name="account_password" type="password" autoComplete="current-password" maxLength={256} autoFocus required />
+                <FieldDescription>
+                  {isCustom ? "Use the password for this email account." : <ApplePasswordHelp />}
+                </FieldDescription>
+              </Field>
+            </FieldGroup>
+            <div className="mt-6 flex flex-col-reverse gap-3 border-t pt-4 sm:flex-row sm:justify-between">
+              <Button type="submit" name="action" value="restart" variant="ghost">Use a different email</Button>
+              <Button type="submit" name="action" value="unlock" size="lg">Continue</Button>
             </div>
           </>
         ) : (
           <>
-            <Hidden name="target" value={page.target} />
-            <Hidden name="preset" value={preset} />
-            <Hidden name="address" value={address} />
+            <Hidden name="onboarding_step" value="config" />
+            <Hidden name="preset" value={page.account.preset} />
+            <Hidden name="address" value={page.account.address} />
             {page.accountId ? <Hidden name="account_id" value={page.accountId} /> : null}
 
-            <FieldGroup>
-              {page.draftNotice ? (
-                <p className="text-sm leading-relaxed text-muted-foreground">
-                  Changes stay in this encrypted reconnect draft until you continue from the account list.
-                </p>
-              ) : null}
-
-              <Field orientation="horizontal" className="items-center rounded-lg border p-3">
-                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border bg-background">
-                  {isCustom ? <Server aria-hidden="true" className="size-4" /> : <Cloud aria-hidden="true" className="size-4" />}
-                </div>
-                <FieldContent className="min-w-0">
-                  <FieldTitle className="truncate">{address}</FieldTitle>
-                  <FieldDescription>{isCustom ? "Custom IMAP/SMTP server" : "iCloud detected"}</FieldDescription>
-                </FieldContent>
-                {page.target !== "edit" ? <Button type="button" variant="ghost" size="sm" onClick={() => setStage("email")}>Change email</Button> : null}
-              </Field>
-
+            <FieldGroup className="gap-4">
               <FieldSet>
-                <FieldLegend>Account details</FieldLegend>
+                <FieldLegend>Account</FieldLegend>
                 <FieldGroup>
                   <Field>
                     <FieldLabel htmlFor="label">Account name</FieldLabel>
@@ -272,22 +252,22 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
                       <Hidden name="custom_fields_present" value="1" />
                       <div className="grid gap-4 sm:grid-cols-[1fr_7rem]">
                         <Field>
-                          <FieldLabel htmlFor="imap_host">IMAP hostname</FieldLabel>
-                          <Input id="imap_host" name="imap_host" maxLength={253} defaultValue={page.account.imap.host} placeholder="imap.example.com" required />
+                          <FieldLabel htmlFor="imap_host">Incoming mail server</FieldLabel>
+                          <Input id="imap_host" name="imap_host" maxLength={253} defaultValue={page.account.imap.host} placeholder="mail.example.com" required />
                         </Field>
                         <Field>
                           <FieldLabel htmlFor="imap_port">Port</FieldLabel>
                           <Input id="imap_port" name="imap_port" type="number" min={1} max={65535} defaultValue={page.account.imap.port} required />
                         </Field>
                       </div>
-                      <TlsSelect name="imap_tls_mode" value={imapTls} onChange={setImapTls} service="IMAP" />
+                      <SecuritySelect name="imap_tls_mode" value={imapTls} onChange={setImapTls} direction="incoming" />
                       <div className="grid gap-4 sm:grid-cols-2">
                         <Field>
-                          <FieldLabel htmlFor="imap_user">IMAP username</FieldLabel>
-                          <Input id="imap_user" name="imap_user" autoComplete="username" maxLength={320} defaultValue={page.account.imap.user || address} required />
+                          <FieldLabel htmlFor="imap_user">Sign-in name</FieldLabel>
+                          <Input id="imap_user" name="imap_user" autoComplete="username" maxLength={320} defaultValue={page.account.imap.user || page.account.address} required />
                         </Field>
                         <Field>
-                          <FieldLabel htmlFor="imap_password">IMAP password</FieldLabel>
+                          <FieldLabel htmlFor="imap_password">Password</FieldLabel>
                           <Input id="imap_password" name="imap_password" type="password" autoComplete="current-password" maxLength={256} required />
                         </Field>
                       </div>
@@ -295,8 +275,37 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
                   ) : (
                     <Field>
                       <FieldLabel htmlFor="app_password">Apple app-specific password</FieldLabel>
-                      <Input id="app_password" name="app_password" type="password" autoComplete="current-password" maxLength={256} placeholder="xxxx-xxxx-xxxx-xxxx" required />
-                      <FieldDescription>Create an app-specific password in your Apple Account security settings.</FieldDescription>
+                      <div className="flex gap-2">
+                        <Input
+                          id="app_password"
+                          name="app_password"
+                          type="password"
+                          autoComplete="current-password"
+                          maxLength={256}
+                          placeholder={editingAppPassword ? "xxxx-xxxx-xxxx-xxxx" : "Saved password"}
+                          value={appPassword}
+                          onChange={(event) => setAppPassword(event.target.value)}
+                          disabled={!editingAppPassword}
+                          required={editingAppPassword}
+                        />
+                        {page.target === "edit" ? (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => {
+                              setAppPassword("");
+                              setEditingAppPassword((current) => !current);
+                            }}
+                          >
+                            {editingAppPassword ? "Cancel" : "Edit"}
+                          </Button>
+                        ) : null}
+                      </div>
+                      <FieldDescription>
+                        {page.target === "edit" && !editingAppPassword
+                          ? <>Your saved password will be used. Use a new <a href="https://support.apple.com/102654" target="_blank" rel="noreferrer" className="font-medium text-foreground underline underline-offset-4">app-specific password</a> only if it changed.</>
+                          : <ApplePasswordHelp includeWarning />}
+                      </FieldDescription>
                     </Field>
                   )}
                 </FieldGroup>
@@ -308,31 +317,31 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
                   <FieldGroup>
                     <div className="grid gap-4 sm:grid-cols-[1fr_7rem]">
                       <Field>
-                        <FieldLabel htmlFor="smtp_host">SMTP hostname</FieldLabel>
-                        <Input id="smtp_host" name="smtp_host" maxLength={253} defaultValue={page.account.smtp.host} placeholder="smtp.example.com" required />
+                        <FieldLabel htmlFor="smtp_host">Outgoing mail server</FieldLabel>
+                        <Input id="smtp_host" name="smtp_host" maxLength={253} defaultValue={page.account.smtp.host} placeholder="mail.example.com" required />
                       </Field>
                       <Field>
                         <FieldLabel htmlFor="smtp_port">Port</FieldLabel>
                         <Input id="smtp_port" name="smtp_port" type="number" min={1} max={65535} defaultValue={page.account.smtp.port} required />
                       </Field>
                     </div>
-                    <TlsSelect name="smtp_tls_mode" value={smtpTls} onChange={setSmtpTls} service="SMTP" />
+                    <SecuritySelect name="smtp_tls_mode" value={smtpTls} onChange={setSmtpTls} direction="outgoing" />
                     <Field orientation="horizontal" className="rounded-lg border p-3">
                       {sameSmtp ? <Hidden name="same_smtp_credentials" value="1" /> : null}
                       <FieldContent>
-                        <FieldLabel htmlFor="same-smtp">Use IMAP credentials for SMTP</FieldLabel>
-                        <FieldDescription>Most providers use the same username and password.</FieldDescription>
+                        <FieldLabel htmlFor="same-smtp">Use the same sign-in details</FieldLabel>
+                        <FieldDescription>Most email providers use the same details for incoming and outgoing mail.</FieldDescription>
                       </FieldContent>
                       <Switch id="same-smtp" checked={sameSmtp} onCheckedChange={setSameSmtp} />
                     </Field>
                     {!sameSmtp ? (
                       <div className="grid gap-4 sm:grid-cols-2">
                         <Field>
-                          <FieldLabel htmlFor="smtp_user">SMTP username</FieldLabel>
-                          <Input id="smtp_user" name="smtp_user" autoComplete="username" maxLength={320} defaultValue={page.account.smtp.user || address} required />
+                          <FieldLabel htmlFor="smtp_user">Outgoing sign-in name</FieldLabel>
+                          <Input id="smtp_user" name="smtp_user" autoComplete="username" maxLength={320} defaultValue={page.account.smtp.user || page.account.address} required />
                         </Field>
                         <Field>
-                          <FieldLabel htmlFor="smtp_password">SMTP password</FieldLabel>
+                          <FieldLabel htmlFor="smtp_password">Outgoing password</FieldLabel>
                           <Input id="smtp_password" name="smtp_password" type="password" autoComplete="current-password" maxLength={256} required />
                         </Field>
                       </div>
@@ -342,7 +351,7 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
               ) : null}
 
               <FieldSet>
-                <FieldLegend>Services</FieldLegend>
+                <FieldLegend>What to connect</FieldLegend>
                 <Hidden name="service_options_present" value="1" />
                 <div className="overflow-hidden rounded-lg border">
                   <ServiceSwitch name="enable_mail" title="Mail" checked={mail} onChange={setMail} icon={Mail} />
@@ -358,20 +367,15 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
               </FieldSet>
             </FieldGroup>
 
-            <div className="mt-8 flex flex-col-reverse gap-3 border-t pt-5 sm:flex-row sm:justify-between">
+            <div className="mt-6 flex flex-col-reverse gap-3 border-t pt-4 sm:flex-row sm:justify-between">
               {page.target === "start" ? (
-                <Button type="submit" name="decision" value="deny" variant="ghost">Cancel</Button>
+                <Button type="submit" name="action" value="restart" variant="ghost">Use a different email</Button>
               ) : (
                 <Button type="submit" name="action" value="list" variant="ghost">Back to accounts</Button>
               )}
-              <div className="flex flex-col-reverse gap-2 sm:flex-row">
-                <Button type="button" variant="outline" onClick={() => chooseProvider(isCustom ? "icloud" : "custom")}>
-                  {isCustom ? "Use iCloud instead" : "Use custom server"}
-                </Button>
-                <Button type="submit" name="action" value="verify" size="lg">
-                  {page.target === "start" ? "Verify and continue" : "Verify and save"}
-                </Button>
-              </div>
+              <Button type="submit" name="action" value="verify" size="lg">
+                {page.target === "edit" ? "Save account" : "Add account"}
+              </Button>
             </div>
           </>
         )}
@@ -404,11 +408,11 @@ function ManagementPage({ page }: { page: Extract<AuthPageModel, { kind: "manage
                   <CardDescription className="truncate">{account.address}</CardDescription>
                 </div>
               </div>
-              {account.isDefault ? <CardAction><Badge>Default</Badge></CardAction> : null}
+              {account.isDefault ? <CardAction><Badge>Used by default</Badge></CardAction> : null}
             </CardHeader>
             <CardContent>
               <div className="flex flex-wrap gap-2">
-                <Badge variant="outline">{account.preset === "icloud" ? "iCloud" : "Custom IMAP/SMTP"}</Badge>
+                <Badge variant="outline">{account.preset === "icloud" ? "iCloud" : "Other provider"}</Badge>
                 {capabilityLabels(account).map((capability) => <Badge key={capability} variant="secondary">{capability}</Badge>)}
               </div>
             </CardContent>
@@ -417,10 +421,12 @@ function ManagementPage({ page }: { page: Extract<AuthPageModel, { kind: "manage
                 <Hidden name="authorization_state" value={page.state} />
                 <Hidden name="mode" value="manage" />
                 <Hidden name="account_id" value={account.accountId} />
-                <Button type="submit" name="action" value="test" variant="outline" size="sm">Test</Button>
-                <Button type="submit" name="action" value="edit" variant="outline" size="sm">Edit</Button>
-                {!account.isDefault ? <Button type="submit" name="action" value="set_default" variant="outline" size="sm">Make default</Button> : null}
-                <Button type="submit" name="action" value="remove" variant="ghost" size="sm">Remove</Button>
+                <Button type="submit" name="action" value="edit" variant="outline" size="sm">
+                  <Pencil aria-hidden="true" data-icon="inline-start" /> Edit
+                </Button>
+                <Button type="submit" name="action" value="remove" variant="ghost" size="sm">
+                  <Trash2 aria-hidden="true" data-icon="inline-start" /> Delete
+                </Button>
               </form>
             </CardFooter>
           </Card>
@@ -434,7 +440,7 @@ function ManagementPage({ page }: { page: Extract<AuthPageModel, { kind: "manage
         <Button type="submit" name="action" value="add" variant="outline" className="sm:ml-auto">
           <Plus aria-hidden="true" data-icon="inline-start" /> Add account
         </Button>
-        <Button type="submit" name="action" value="continue" size="lg">Continue</Button>
+        <Button type="submit" name="action" value="continue" size="lg">Save and exit</Button>
       </form>
     </PageFrame>
   );
