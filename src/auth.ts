@@ -9,6 +9,7 @@ import {
   storeMailCredentials,
   verifyMailCredentials,
 } from "./credentials";
+import { logFailure } from "./diagnostics";
 import { RESOURCE_SCOPES, type MailCredentials, type OAuthEnv } from "./types";
 
 const AUTH_STATE_TTL_SECONDS = 600;
@@ -486,6 +487,11 @@ export function createCredentialAuthHandler(dependencies: CredentialAuthDependen
         }
         return new Response("Not found", { status: 404 });
       } catch (error) {
+        logFailure(
+          "oauth_request_failed",
+          { method: request.method, path: url.pathname },
+          error,
+        );
         if (isCredentialConfigurationError(error)) return jsonError("Mail credential storage is not configured", 503);
         return jsonError("OAuth authorization failed", 502);
       }

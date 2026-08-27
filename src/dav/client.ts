@@ -1,4 +1,5 @@
 import { getDavConfig } from "../config";
+import { annotateSpanFailure, logFailure } from "../diagnostics";
 import type { DavConfig, MailConfig } from "../types";
 import { withSpan } from "../tracing";
 import { parseCalendarResource, serializeCalendarItem, IcalendarParseError } from "./ical";
@@ -373,9 +374,14 @@ function parseCalendar(raw: string, href: string, etag: string | null): Calendar
     "dav.service": "calendar",
     "dav.resource_bytes": new TextEncoder().encode(raw).byteLength,
   }, (span) => {
-    const item = parseCalendarResource(raw, href, etag, MAX_DAV_RESOURCE_BYTES);
-    span.setAttribute("dav.component_type", item.componentType);
-    return item;
+    try {
+      const item = parseCalendarResource(raw, href, etag, MAX_DAV_RESOURCE_BYTES);
+      span.setAttribute("dav.component_type", item.componentType);
+      return item;
+    } catch (error) {
+      annotateSpanFailure(span, error);
+      throw error;
+    }
   });
 }
 
@@ -384,9 +390,14 @@ function parseContact(raw: string, href: string, etag: string | null): Contact {
     "dav.service": "contacts",
     "dav.resource_bytes": new TextEncoder().encode(raw).byteLength,
   }, (span) => {
-    const contact = parseContactResource(raw, href, etag, MAX_DAV_RESOURCE_BYTES);
-    span.setAttribute("dav.resource_type", "vcard");
-    return contact;
+    try {
+      const contact = parseContactResource(raw, href, etag, MAX_DAV_RESOURCE_BYTES);
+      span.setAttribute("dav.resource_type", "vcard");
+      return contact;
+    } catch (error) {
+      annotateSpanFailure(span, error);
+      throw error;
+    }
   });
 }
 
@@ -440,66 +451,81 @@ export class DavClient {
     options: { headers?: Record<string, string>; body?: string } = {},
   ): Promise<DavHttpResponse> {
     return withSpan("dav.request", { "dav.service": service, "dav.method": method }, async (span) => {
-      let url = this.assertUrl(target, service);
       let redirects = 0;
       const bodyBytes = options.body === undefined ? 0 : new TextEncoder().encode(options.body).byteLength;
-      if (bodyBytes > MAX_DAV_REQUEST_BYTES) throw new DavPayloadTooLargeError("The DAV request body is too large");
-      while (true) {
-        const headers = new Headers({
-          Accept: "application/xml, text/calendar, text/vcard, text/*;q=0.8",
-          Authorization: this.authHeader,
-          "Cache-Control": "no-store",
-          "User-Agent": "icloud-mail-mcp/0.1",
-          ...options.headers,
-        });
-        const response = await this.fetcher(url, {
-          method,
-          headers,
-          body: options.body,
-          cache: "no-store",
-          redirect: "manual",
-        });
-        span.setAttribute("dav.http_status", response.status);
-        if (response.status >= 300 && response.status < 400) {
-          if (redirects >= MAX_REDIRECTS) {
+      try {
+        let url = this.assertUrl(target, service);
+        if (bodyBytes > MAX_DAV_REQUEST_BYTES) throw new DavPayloadTooLargeError("The DAV request body is too large");
+        while (true) {
+          const headers = new Headers({
+            Accept: "application/xml, text/calendar, text/vcard, text/*;q=0.8",
+            Authorization: this.authHeader,
+            "Cache-Control": "no-store",
+            "User-Agent": "icloud-mail-mcp/0.1",
+            ...options.headers,
+          });
+          const response = await this.fetcher(url, {
+            method,
+            headers,
+            body: options.body,
+            cache: "no-store",
+            redirect: "manual",
+          });
+          span.setAttribute("dav.http_status", response.status);
+          if (response.status >= 300 && response.status < 400) {
+            if (redirects >= MAX_REDIRECTS) {
+              await discardResponse(response);
+              throw new DavProtocolError("The iCloud DAV service redirected too many times");
+            }
+            const location = response.headers.get("Location");
             await discardResponse(response);
-            throw new DavProtocolError("The iCloud DAV service redirected too many times");
+            if (!location) throw new DavProtocolError("The iCloud DAV redirect omitted a location");
+            url = this.resolveUrl(location, url, service);
+            redirects += 1;
+            continue;
           }
-          const location = response.headers.get("Location");
-          await discardResponse(response);
-          if (!location) throw new DavProtocolError("The iCloud DAV redirect omitted a location");
-          url = this.resolveUrl(location, url, service);
-          redirects += 1;
-          continue;
+          span.setAttribute("dav.redirect_count", redirects);
+          if (response.status === 401) {
+            await discardResponse(response);
+            throw new DavAuthenticationError();
+          }
+          if (response.status === 403) {
+            await discardResponse(response);
+            throw new DavPermissionError();
+          }
+          if (response.status === 404) {
+            await discardResponse(response);
+            throw new DavNotFoundError();
+          }
+          if (response.status === 409 || response.status === 412) {
+            await discardResponse(response);
+            throw new DavConflictError(response.status);
+          }
+          if (response.status >= 500) {
+            await discardResponse(response);
+            throw new DavProtocolError("The iCloud DAV service is temporarily unavailable", response.status);
+          }
+          if (response.status < 200 || response.status >= 300) {
+            await discardResponse(response);
+            throw new DavProtocolError(`The iCloud DAV request failed with HTTP ${response.status}`, response.status);
+          }
+          const body = await readBoundedResponse(response, method === "GET" ? MAX_DAV_RESOURCE_BYTES : MAX_DAV_RESPONSE_BYTES);
+          span.setAttribute("dav.response_bytes", body.byteLength);
+          return { url: url.toString(), status: response.status, headers: response.headers, body };
         }
-        span.setAttribute("dav.redirect_count", redirects);
-        if (response.status === 401) {
-          await discardResponse(response);
-          throw new DavAuthenticationError();
-        }
-        if (response.status === 403) {
-          await discardResponse(response);
-          throw new DavPermissionError();
-        }
-        if (response.status === 404) {
-          await discardResponse(response);
-          throw new DavNotFoundError();
-        }
-        if (response.status === 409 || response.status === 412) {
-          await discardResponse(response);
-          throw new DavConflictError(response.status);
-        }
-        if (response.status >= 500) {
-          await discardResponse(response);
-          throw new DavProtocolError("The iCloud DAV service is temporarily unavailable", response.status);
-        }
-        if (response.status < 200 || response.status >= 300) {
-          await discardResponse(response);
-          throw new DavProtocolError(`The iCloud DAV request failed with HTTP ${response.status}`, response.status);
-        }
-        const body = await readBoundedResponse(response, method === "GET" ? MAX_DAV_RESOURCE_BYTES : MAX_DAV_RESPONSE_BYTES);
-        span.setAttribute("dav.response_bytes", body.byteLength);
-        return { url: url.toString(), status: response.status, headers: response.headers, body };
+      } catch (error) {
+        annotateSpanFailure(span, error);
+        logFailure(
+          "dav_request_failed",
+          {
+            service,
+            method,
+            redirect_count: redirects,
+            request_bytes: bodyBytes,
+          },
+          error,
+        );
+        throw error;
       }
     });
   }
@@ -509,7 +535,16 @@ export class DavClient {
       headers: { "Content-Type": "application/xml; charset=utf-8", Depth: depth },
       body,
     });
-    return { response, entries: parseMultiStatus(response.body) };
+    try {
+      return { response, entries: parseMultiStatus(response.body) };
+    } catch (error) {
+      logFailure(
+        "dav_response_parse_failed",
+        { service, method: "PROPFIND", response_bytes: response.body.byteLength },
+        error,
+      );
+      throw error;
+    }
   }
 
   private async report(service: DavService, url: URL, body: string): Promise<{ response: DavHttpResponse; entries: DavEntry[] }> {
@@ -518,11 +553,21 @@ export class DavClient {
         headers: { "Content-Type": "application/xml; charset=utf-8", Depth: "1" },
         body,
       });
-      const entries = parseMultiStatus(response.body);
-      span.setAttribute("dav.response_status", response.status);
-      span.setAttribute("dav.response_bytes", response.body.byteLength);
-      span.setAttribute("dav.resource_count", entries.length);
-      return { response, entries };
+      try {
+        const entries = parseMultiStatus(response.body);
+        span.setAttribute("dav.response_status", response.status);
+        span.setAttribute("dav.response_bytes", response.body.byteLength);
+        span.setAttribute("dav.resource_count", entries.length);
+        return { response, entries };
+      } catch (error) {
+        annotateSpanFailure(span, error);
+        logFailure(
+          "dav_response_parse_failed",
+          { service, method: "REPORT", response_bytes: response.body.byteLength },
+          error,
+        );
+        throw error;
+      }
     });
   }
 

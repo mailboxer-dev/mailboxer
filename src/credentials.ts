@@ -2,6 +2,7 @@ import { z } from "zod";
 import { getCredentialsEncryptionSecret, getDavConfig, getMailConfig } from "./config";
 import { DavClient } from "./dav/client";
 import type { DavService } from "./dav/types";
+import { annotateSpanFailure, logFailure } from "./diagnostics";
 import { ImapClient } from "./imap/client";
 import { SmtpClient } from "./smtp/client";
 import { withSpan } from "./tracing";
@@ -179,21 +180,31 @@ async function verifyImap(
   return withSpan(
     "mail.credentials.verify_imap",
     { "mail.credentials.imap_candidate": candidate },
-    async () => {
-      const client = await open(config);
-      client.close();
+    async (span) => {
+      try {
+        const client = await open(config);
+        client.close();
+      } catch (error) {
+        annotateSpanFailure(span, error);
+        throw error;
+      }
     },
   );
 }
 
 async function verifySmtp(config: MailConfig, open: typeof SmtpClient.open): Promise<void> {
-  return withSpan("mail.credentials.verify_smtp", {}, async () => {
-    const client = await open(config);
+  return withSpan("mail.credentials.verify_smtp", {}, async (span) => {
     try {
-      await client.authenticate();
-    } finally {
-      await client.quit().catch(() => undefined);
-      client.close();
+      const client = await open(config);
+      try {
+        await client.authenticate();
+      } finally {
+        await client.quit().catch(() => undefined);
+        client.close();
+      }
+    } catch (error) {
+      annotateSpanFailure(span, error);
+      throw error;
     }
   });
 }
@@ -230,6 +241,7 @@ export async function verifyMailCredentials(
 
   if (mailRequested) {
     let imapVerified = false;
+    let lastImapError: unknown;
     for (const [index, imapUser] of imapUserCandidates(submission.email).entries()) {
       const config = getMailConfig(env, {
         email: submission.email,
@@ -241,16 +253,33 @@ export async function verifyMailCredentials(
         verifiedConfig = config;
         imapVerified = true;
         break;
-      } catch {
+      } catch (error) {
+        lastImapError = error;
         // Apple accepts either the local part or, for some accounts, the full address.
       }
     }
 
-    if (!imapVerified) throw new MailCredentialError("iCloud credentials could not be verified");
+    if (!imapVerified) {
+      logFailure(
+        "icloud_credentials_verification_failed",
+        {
+          service: "imap",
+          operation: "login",
+          candidate_count: imapUserCandidates(submission.email).length,
+        },
+        lastImapError ?? new Error("No IMAP username candidate was accepted"),
+      );
+      throw new MailCredentialError("iCloud credentials could not be verified");
+    }
     if (mailWriteRequested) {
       try {
         await verifySmtp(verifiedConfig, smtpOpen);
-      } catch {
+      } catch (error) {
+        logFailure(
+          "icloud_credentials_verification_failed",
+          { service: "smtp", operation: "authenticate" },
+          error,
+        );
         throw new MailCredentialError("iCloud SMTP credentials could not be verified");
       }
     }
@@ -262,7 +291,12 @@ export async function verifyMailCredentials(
   ]) {
     try {
       await davVerify(verifiedConfig, service);
-    } catch {
+    } catch (error) {
+      logFailure(
+        "icloud_credentials_verification_failed",
+        { service, operation: "discover" },
+        error,
+      );
       throw new MailCredentialError("iCloud DAV credentials could not be verified");
     }
   }
