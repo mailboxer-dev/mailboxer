@@ -1006,12 +1006,18 @@ async function completeAuthorization(
 
   let submission = accountSubmissionFromForm(form);
   const existingId = target === "edit" ? form.get("account_id") ?? undefined : undefined;
-  if (target === "edit" && submission.preset === "icloud" && !submission.appPassword) {
+  if (target === "edit" && (submission.preset === "icloud" || submission.preset === "custom")) {
     const draft = await loadAccountDraft(env, stateToken);
     if (!draft) return jsonError("Expired authorization state", 400);
-    const existing = draft.accounts.find((account) => account.accountId === existingId && account.preset === "icloud");
+    const existing = draft.accounts.find((account) => account.accountId === existingId && account.preset === submission.preset);
     if (!existing) throw new AccountVaultError("The saved account could not be opened");
-    submission = { ...submission, appPassword: existing.config.password };
+    submission = submission.preset === "icloud"
+      ? { ...submission, appPassword: submission.appPassword ?? existing.config.password }
+      : {
+        ...submission,
+        imapPassword: submission.imapPassword ?? existing.config.password,
+        smtpPassword: submission.smtpPassword ?? existing.config.smtpPassword,
+      };
   }
   let verifiedAccount: StoredMailAccount;
   try {
