@@ -60,6 +60,29 @@ function account(seed = "primary"): StoredMailAccount {
   };
 }
 
+function customAccount(): StoredMailAccount {
+  return {
+    accountId: "acct_customxxxxxxxxxxxxxxxx",
+    label: "Work",
+    preset: "custom",
+    address: "person@example.com",
+    capabilities: { mail: true, calendar: false, contacts: false },
+    config: {
+      email: "person@example.com",
+      imapUser: "incoming-user",
+      password: "incoming-password",
+      imapHost: "imap.example.com",
+      imapPort: 993,
+      imapTlsMode: "implicit",
+      smtpHost: "smtp.example.com",
+      smtpPort: 587,
+      smtpTlsMode: "starttls",
+      smtpUser: "outgoing-user",
+      smtpPassword: "outgoing-password",
+    },
+  };
+}
+
 function oauthEnv(options: {
   kv?: MemoryKv;
   complete?: OAuthHelpers["completeAuthorization"];
@@ -586,6 +609,80 @@ describe("multi-account OAuth authorization", () => {
     const model = await pageModel(response);
     expect(model.kind).toBe("management");
     if (model.kind === "management") expect(model.accounts[0]?.label).toBe("Renamed");
+  });
+
+  it.each([
+    {
+      name: "neither password is replaced",
+      passwordFields: {},
+      expectedIncoming: "incoming-password",
+      expectedOutgoing: "outgoing-password",
+    },
+    {
+      name: "only the incoming password is replaced",
+      passwordFields: { imap_password: "new-incoming-password" },
+      expectedIncoming: "new-incoming-password",
+      expectedOutgoing: "outgoing-password",
+    },
+    {
+      name: "only the outgoing password is replaced",
+      passwordFields: { smtp_password: "new-outgoing-password" },
+      expectedIncoming: "incoming-password",
+      expectedOutgoing: "new-outgoing-password",
+    },
+  ])("preserves custom account credentials when $name", async ({ passwordFields, expectedIncoming, expectedOutgoing }) => {
+    const credentialsKv = new MemoryKv();
+    const environment = oauthEnv({ credentialsKv });
+    const savedAccount = customAccount();
+    const vault = await commitAccountDraft(environment, newAccountDraft(savedAccount));
+    const verify = vi.fn(async (_env, submission: AccountSubmission) => ({
+      ...savedAccount,
+      accountId: vault.defaultAccountId,
+      label: submission.label,
+      config: {
+        ...savedAccount.config,
+        password: submission.imapPassword ?? "",
+        smtpPassword: submission.smtpPassword ?? "",
+      },
+    }));
+    const authFetch = authFetchFor({ verifyAccountSubmission: verify });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
+    const { state, cookie } = stateAndCookie(authorize);
+    await authFetch(lookupForm(state, cookie, savedAccount.address), environment, context);
+    await authFetch(unlockForm(state, cookie, vault.defaultAccountId, savedAccount.config.password), environment, context);
+    await authFetch(post(state, cookie, { action: "edit", account_id: vault.defaultAccountId }), environment, context);
+
+    const response = await authFetch(post(state, cookie, {
+      action: "verify",
+      target: "edit",
+      account_id: vault.defaultAccountId,
+      preset: "custom",
+      label: "Renamed work account",
+      address: savedAccount.address,
+      service_options_present: "1",
+      enable_mail: "1",
+      custom_fields_present: "1",
+      imap_host: savedAccount.config.imapHost,
+      imap_port: String(savedAccount.config.imapPort),
+      imap_tls_mode: savedAccount.config.imapTlsMode,
+      imap_user: savedAccount.config.imapUser,
+      smtp_host: savedAccount.config.smtpHost,
+      smtp_port: String(savedAccount.config.smtpPort),
+      smtp_tls_mode: savedAccount.config.smtpTlsMode,
+      smtp_user: savedAccount.config.smtpUser,
+      ...(passwordFields as Record<string, string>),
+    }), environment, context);
+
+    expect(response.status).toBe(200);
+    expect(verify).toHaveBeenCalledOnce();
+    expect(verify.mock.calls[0]?.[1]).toMatchObject({
+      imapPassword: expectedIncoming,
+      smtpPassword: expectedOutgoing,
+      sameSmtpCredentials: false,
+    });
+    const model = await pageModel(response);
+    expect(model.kind).toBe("management");
+    if (model.kind === "management") expect(model.accounts[0]?.label).toBe("Renamed work account");
   });
 
   it("returns a generic verification error and enforces the five-attempt limit", async () => {

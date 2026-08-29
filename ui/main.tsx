@@ -182,6 +182,10 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
   const [smtpTls, setSmtpTls] = useState(page.account.smtp.tlsMode);
   const [editingAppPassword, setEditingAppPassword] = useState(page.target !== "edit");
   const [appPassword, setAppPassword] = useState("");
+  const [editingImapPassword, setEditingImapPassword] = useState(page.target !== "edit");
+  const [imapPassword, setImapPassword] = useState("");
+  const [editingSmtpPassword, setEditingSmtpPassword] = useState(page.target !== "edit");
+  const [smtpPassword, setSmtpPassword] = useState("");
   const isCustom = page.account.preset === "custom";
   const defaultLabel = page.account.label || (isCustom ? page.account.address.split("@")[0] || "Email" : "iCloud");
 
@@ -300,7 +304,37 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
                         </Field>
                         <Field>
                           <FieldLabel htmlFor="imap_password">Password</FieldLabel>
-                          <Input id="imap_password" name="imap_password" type="password" autoComplete="current-password" maxLength={256} required />
+                          <div className="flex gap-2">
+                            <Input
+                              id="imap_password"
+                              name="imap_password"
+                              type="password"
+                              autoComplete="current-password"
+                              maxLength={256}
+                              placeholder={editingImapPassword ? undefined : "Saved password"}
+                              value={imapPassword}
+                              onChange={(event) => setImapPassword(event.target.value)}
+                              disabled={!editingImapPassword}
+                              required={editingImapPassword}
+                            />
+                            {page.target === "edit" ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                onClick={() => {
+                                  setImapPassword("");
+                                  setEditingImapPassword((current) => !current);
+                                }}
+                              >
+                                {editingImapPassword ? "Cancel" : "Edit"}
+                              </Button>
+                            ) : null}
+                          </div>
+                          <FieldDescription>
+                            {page.target === "edit" && !editingImapPassword
+                              ? "Your saved password will be used. Enter a new password only if it changed."
+                              : "Use the password for this email account."}
+                          </FieldDescription>
                         </Field>
                       </div>
                     </>
@@ -374,7 +408,37 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
                         </Field>
                         <Field>
                           <FieldLabel htmlFor="smtp_password">Outgoing password</FieldLabel>
-                          <Input id="smtp_password" name="smtp_password" type="password" autoComplete="current-password" maxLength={256} required />
+                          <div className="flex gap-2">
+                            <Input
+                              id="smtp_password"
+                              name="smtp_password"
+                              type="password"
+                              autoComplete="current-password"
+                              maxLength={256}
+                              placeholder={editingSmtpPassword ? undefined : "Saved password"}
+                              value={smtpPassword}
+                              onChange={(event) => setSmtpPassword(event.target.value)}
+                              disabled={!editingSmtpPassword}
+                              required={editingSmtpPassword}
+                            />
+                            {page.target === "edit" ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                onClick={() => {
+                                  setSmtpPassword("");
+                                  setEditingSmtpPassword((current) => !current);
+                                }}
+                              >
+                                {editingSmtpPassword ? "Cancel" : "Edit"}
+                              </Button>
+                            ) : null}
+                          </div>
+                          <FieldDescription>
+                            {page.target === "edit" && !editingSmtpPassword
+                              ? "Your saved password will be used. Enter a new password only if it changed."
+                              : "Use the password for outgoing mail."}
+                          </FieldDescription>
                         </Field>
                       </div>
                     ) : null}
@@ -449,7 +513,7 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
               {page.target === "start" ? (
                 <Button type="submit" name="action" value="restart" variant="ghost">Use a different email</Button>
               ) : (
-                <Button type="submit" name="action" value="list" variant="ghost">Back to accounts</Button>
+                <Button type="submit" name="action" value="list" variant="ghost" formNoValidate>Back to accounts</Button>
               )}
               <Button type="submit" name="action" value="verify" size="lg">
                 {page.target === "edit" ? "Save account" : "Add account"}
