@@ -6,8 +6,6 @@ const env = {
   OAUTH_KV: {} as KVNamespace,
   MAIL_CREDENTIALS_KV: {} as KVNamespace,
   MAIL_CREDENTIALS_ENCRYPTION_KEY: "a-secure-test-encryption-key-with-32-chars",
-  CALDAV_URL: "https://caldav.icloud.com/",
-  CARDDAV_URL: "https://contacts.icloud.com/",
 } as unknown as AppEnv;
 
 const context = {} as unknown as ExecutionContext;

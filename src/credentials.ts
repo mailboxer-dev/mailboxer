@@ -1,11 +1,12 @@
 import { z } from "zod";
-import { getCredentialsEncryptionSecret, getDavConfig, getMailConfig } from "./config";
+import { getCredentialsEncryptionSecret, getMailConfig } from "./config";
 import { DavClient } from "./dav/client";
 import type { DavService } from "./dav/types";
 import { annotateSpanFailure, logFailure } from "./diagnostics";
 import { ImapClient } from "./imap/client";
 import { SmtpClient } from "./smtp/client";
 import { withSpan } from "./tracing";
+import { ICLOUD_DAV_CONFIG } from "./providers";
 import {
   type AppEnv,
   type MailConfig,
@@ -233,7 +234,7 @@ export async function verifyMailCredentials(
   const imapOpen = dependencies.imapOpen ?? ImapClient.open;
   const smtpOpen = dependencies.smtpOpen ?? SmtpClient.open;
   const davVerify = dependencies.davVerify ?? ((config: MailConfig, service: DavService) => (
-    new DavClient(config, getDavConfig(env)).verifyService(service)
+    new DavClient(config, ICLOUD_DAV_CONFIG).verifyService(service)
   ));
   let verifiedConfig = getMailConfig(env, {
     email: submission.email,

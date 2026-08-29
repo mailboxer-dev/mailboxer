@@ -29,8 +29,6 @@ function testEnv(credentialsKv: KVNamespace = {} as KVNamespace): AppEnv {
     OAUTH_KV: {} as KVNamespace,
     MAIL_CREDENTIALS_KV: credentialsKv,
     OAUTH_PROVIDER: {} as OAuthHelpers,
-    CALDAV_URL: "https://caldav.icloud.com/",
-    CARDDAV_URL: "https://contacts.icloud.com/",
     MAIL_CREDENTIALS_ENCRYPTION_KEY: "a-secure-test-encryption-key-with-32-chars",
   };
 }

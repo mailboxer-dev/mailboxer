@@ -45,9 +45,5 @@
     {
       "binding": "MAIL_CREDENTIALS_KV"
     }
-  ],
-  "vars": {
-    "CALDAV_URL": "https://caldav.icloud.com/",
-    "CARDDAV_URL": "https://contacts.icloud.com/"
-  }
+  ]
 }

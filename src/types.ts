@@ -78,6 +78,7 @@ export interface StoredMailAccount {
   address: string;
   capabilities: AccountCapabilities;
   config: MailConfig;
+  davConfig?: DavConfig;
 }
 
 export interface AccountVaultV2 {
@@ -89,8 +90,9 @@ export interface AccountVaultV2 {
 }
 
 export interface DavConfig {
-  caldavUrl: string;
-  carddavUrl: string;
+  caldavUrl?: string;
+  carddavUrl?: string;
+  username?: string;
 }
 
 export interface MailCredentials {

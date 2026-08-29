@@ -1,4 +1,5 @@
-import { getDavConfig } from "../config";
+import { isICloudDavHost } from "../config";
+import { ICLOUD_DAV_CONFIG } from "../providers";
 import { annotateSpanFailure, logFailure } from "../diagnostics";
 import type { DavConfig, MailConfig } from "../types";
 import { withSpan } from "../tracing";
@@ -74,34 +75,34 @@ export class DavProtocolError extends Error {
 
 export class DavAuthenticationError extends DavProtocolError {
   constructor() {
-    super("iCloud DAV authentication failed", 401);
+    super("DAV authentication failed", 401);
     this.name = "DavAuthenticationError";
   }
 }
 
 export class DavPermissionError extends DavProtocolError {
   constructor() {
-    super("The iCloud DAV service denied access", 403);
+    super("The DAV service denied access", 403);
     this.name = "DavPermissionError";
   }
 }
 
 export class DavNotFoundError extends DavProtocolError {
   constructor() {
-    super("The iCloud DAV resource was not found", 404);
+    super("The DAV resource was not found", 404);
     this.name = "DavNotFoundError";
   }
 }
 
 export class DavConflictError extends DavProtocolError {
   constructor(status = 412) {
-    super("The iCloud DAV resource changed; refresh it and retry with its current ETag", status);
+    super("The DAV resource changed; refresh it and retry with its current ETag", status);
     this.name = "DavConflictError";
   }
 }
 
 export class DavPayloadTooLargeError extends DavProtocolError {
-  constructor(message = "The iCloud DAV response is too large") {
+  constructor(message = "The DAV response is too large") {
     super(message);
     this.name = "DavPayloadTooLargeError";
   }
@@ -228,7 +229,7 @@ function decodeUtf8(bytes: Uint8Array): string {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
-    throw new DavProtocolError("The iCloud DAV response was not valid UTF-8");
+    throw new DavProtocolError("The DAV response was not valid UTF-8");
   }
 }
 
@@ -237,13 +238,13 @@ function parseMultiStatus(bytes: Uint8Array): DavEntry[] {
   try {
     root = parseXml(decodeUtf8(bytes), { maxNodes: MAX_XML_NODES });
   } catch (error) {
-    if (error instanceof XmlParseError) throw new DavProtocolError("The iCloud DAV XML response was invalid");
+    if (error instanceof XmlParseError) throw new DavProtocolError("The DAV XML response was invalid");
     throw error;
   }
-  if (root.localName !== "multistatus" || root.namespace !== DAV_NS) throw new DavProtocolError("The iCloud DAV response was not a multistatus document");
+  if (root.localName !== "multistatus" || root.namespace !== DAV_NS) throw new DavProtocolError("The DAV response was not a multistatus document");
   return children(root, "response", DAV_NS).map((response) => {
     const href = safeText(xmlText(child(response, "href", DAV_NS) ?? EMPTY_XML_NODE));
-    if (!href) throw new DavProtocolError("The iCloud DAV response omitted a resource href");
+    if (!href) throw new DavProtocolError("The DAV response omitted a resource href");
     const propertyStatuses = children(response, "propstat", DAV_NS).flatMap((propstat) => {
       const status = responseStatus(xmlText(child(propstat, "status", DAV_NS) ?? EMPTY_XML_NODE)) ?? 200;
       const prop = child(propstat, "prop", DAV_NS);
@@ -295,10 +296,10 @@ function normalizeHref(value: string, base: URL, service: DavService): string {
   try {
     href = new URL(value, base);
   } catch {
-    throw new DavProtocolError("The iCloud DAV response contained an invalid href");
+    throw new DavProtocolError("The DAV response contained an invalid href");
   }
   if (href.protocol !== "https:" || href.username || href.password || href.hash || (href.port && href.port !== "443") || !serviceHost(service, href.hostname)) {
-    throw new DavProtocolError("The iCloud DAV response contained an unsafe href");
+    throw new DavProtocolError("The DAV response contained an unsafe href");
   }
   return href.toString();
 }
@@ -416,28 +417,35 @@ export class DavClient {
 
   constructor(
     credentials: Pick<MailConfig, "email" | "password">,
-    config: DavConfig = getDavConfig({}),
+    config: DavConfig = ICLOUD_DAV_CONFIG,
     fetcher: DavFetcher = defaultDavFetcher,
   ) {
-    this.authHeader = `Basic ${base64(credentials.email, credentials.password)}`;
+    this.authHeader = `Basic ${base64(config.username ?? credentials.email, credentials.password)}`;
     this.config = config;
     this.fetcher = fetcher;
   }
 
   private initialUrl(service: DavService): URL {
     const value = service === "calendar" ? this.config.caldavUrl : this.config.carddavUrl;
+    if (!value) throw new DavProtocolError(`No ${service === "calendar" ? "calendar" : "contacts"} server is configured`);
     let url: URL;
     try {
       url = new URL(value);
     } catch {
-      throw new DavProtocolError("The configured iCloud DAV URL is invalid");
+      throw new DavProtocolError("The configured DAV URL is invalid");
     }
     return this.assertUrl(url, service);
   }
 
   private assertUrl(url: URL, service: DavService): URL {
-    if (url.protocol !== "https:" || url.username || url.password || url.hash || (url.port && url.port !== "443") || !serviceHost(service, url.hostname)) {
-      throw new DavProtocolError("The configured iCloud DAV URL is unsafe");
+    const configuredValue = service === "calendar" ? this.config.caldavUrl : this.config.carddavUrl;
+    if (!configuredValue) throw new DavProtocolError(`No ${service === "calendar" ? "calendar" : "contacts"} server is configured`);
+    const configured = new URL(configuredValue);
+    const allowedHost = isICloudDavHost(configured.hostname, service)
+      ? serviceHost(service, url.hostname)
+      : url.hostname.toLowerCase() === configured.hostname.toLowerCase();
+    if (url.protocol !== "https:" || url.username || url.password || url.hash || (url.port && url.port !== "443") || !allowedHost) {
+      throw new DavProtocolError("The configured DAV URL is unsafe");
     }
     return url;
   }
@@ -447,7 +455,7 @@ export class DavClient {
       return this.assertUrl(new URL(value, base), service);
     } catch (error) {
       if (error instanceof DavProtocolError) throw error;
-      throw new DavProtocolError("The iCloud DAV response contained an invalid URL");
+      throw new DavProtocolError("The DAV response contained an invalid URL");
     }
   }
 
@@ -482,11 +490,11 @@ export class DavClient {
           if (response.status >= 300 && response.status < 400) {
             if (redirects >= MAX_REDIRECTS) {
               await discardResponse(response);
-              throw new DavProtocolError("The iCloud DAV service redirected too many times");
+              throw new DavProtocolError("The DAV service redirected too many times");
             }
             const location = response.headers.get("Location");
             await discardResponse(response);
-            if (!location) throw new DavProtocolError("The iCloud DAV redirect omitted a location");
+            if (!location) throw new DavProtocolError("The DAV redirect omitted a location");
             url = this.resolveUrl(location, url, service);
             redirects += 1;
             continue;
@@ -510,11 +518,11 @@ export class DavClient {
           }
           if (response.status >= 500) {
             await discardResponse(response);
-            throw new DavProtocolError("The iCloud DAV service is temporarily unavailable", response.status);
+            throw new DavProtocolError("The DAV service is temporarily unavailable", response.status);
           }
           if (response.status < 200 || response.status >= 300) {
             await discardResponse(response);
-            throw new DavProtocolError(`The iCloud DAV request failed with HTTP ${response.status}`, response.status);
+            throw new DavProtocolError(`The DAV request failed with HTTP ${response.status}`, response.status);
           }
           const body = await readBoundedResponse(response, method === "GET" ? MAX_DAV_RESOURCE_BYTES : MAX_DAV_RESPONSE_BYTES);
           span.setAttribute("dav.response_bytes", body.byteLength);
@@ -602,7 +610,7 @@ export class DavClient {
       const homeNamespace = service === "calendar" ? CALDAV_NS : CARDDAV_NS;
       const homeHref = (principalEntry ? propertyHref(principalEntry, homeName, homeNamespace) : null) ??
         (bootstrapEntry ? propertyHref(bootstrapEntry, homeName, homeNamespace) : null);
-      if (!homeHref) throw new DavProtocolError("The iCloud DAV service did not advertise a home collection");
+      if (!homeHref) throw new DavProtocolError("The DAV service did not advertise a home collection");
       const homeUrl = this.resolveUrl(homeHref, new URL(principal.response.url), service);
       span.setAttribute("dav.redirected", bootstrap.response.url !== configured.toString());
       this.discovery.set(service, { rootUrl: rootUrl.toString(), homeUrl: homeUrl.toString() });
@@ -649,7 +657,7 @@ export class DavClient {
   }
 
   private collectionUrl(service: DavService, href: string): URL {
-    const base = new URL(service === "calendar" ? this.config.caldavUrl : this.config.carddavUrl);
+    const base = this.initialUrl(service);
     return this.resolveUrl(href, base, service);
   }
 

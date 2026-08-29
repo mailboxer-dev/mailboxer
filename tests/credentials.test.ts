@@ -40,8 +40,6 @@ function env(credentialsKv: MemoryKv, key = encryptionKey): AppEnv {
     OAUTH_KV: {} as KVNamespace,
     MAIL_CREDENTIALS_KV: credentialsKv as unknown as KVNamespace,
     OAUTH_PROVIDER: {} as OAuthHelpers,
-    CALDAV_URL: "https://caldav.icloud.com/",
-    CARDDAV_URL: "https://contacts.icloud.com/",
     MAIL_CREDENTIALS_ENCRYPTION_KEY: key,
   };
 }

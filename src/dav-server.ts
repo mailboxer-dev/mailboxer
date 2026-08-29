@@ -1,7 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { resolveAccount } from "./accounts";
-import { getCredentialsEncryptionSecret, getDavConfig } from "./config";
+import { getCredentialsEncryptionSecret } from "./config";
+import { davConfigForAccount } from "./providers";
 import {
   MAX_DAV_PAGE_SIZE,
   MAX_DAV_RESOURCE_BYTES,
@@ -108,15 +109,16 @@ async function selectUserDav(
   props: AuthProps,
   accountId: string | undefined,
   capability: Extract<AccountCapability, "calendar" | "contacts">,
-): Promise<{ client: DavClient; account: AccountSummary }> {
+): Promise<{ client: DavClient; account: AccountSummary; domain: string }> {
   const selected = await resolveAccount(env, props, accountId, capability);
-  if (selected.account.preset !== "icloud") throw new Error("Custom DAV servers are not supported");
-  return { client: new DavClient(selected.account.config, getDavConfig(env)), account: selected.summary };
-}
-
-function serviceDomain(env: AppEnv, service: "calendar" | "contacts"): string {
-  const config = getDavConfig(env);
-  return new URL(service === "calendar" ? config.caldavUrl : config.carddavUrl).hostname.toLowerCase();
+  const config = davConfigForAccount(selected.account);
+  const value = capability === "calendar" ? config.caldavUrl : config.carddavUrl;
+  if (!value) throw new Error(`The selected account does not have a ${capability} server configured`);
+  return {
+    client: new DavClient(selected.account.config, config),
+    account: selected.summary,
+    domain: new URL(value).hostname.toLowerCase(),
+  };
 }
 
 function normalized(value: string | undefined): string | undefined {
@@ -181,7 +183,7 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
         const selected = await selectUserDav(env, props, accountId, "calendar");
         const fingerprint = await cursorFingerprint({ accountId: selected.account.accountId, ...query, limit });
         const secret = getCredentialsEncryptionSecret(env);
-        const domain = serviceDomain(env, "calendar");
+        const domain = selected.domain;
         const afterHref = await cursorAfter(cursor, domain, fingerprint, secret);
         const page = await selected.client.listCalendarItems(query, afterHref, limit);
         const nextCursor = page.hasMore && page.lastHref
@@ -318,7 +320,7 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
         const selected = await selectUserDav(env, props, accountId, "contacts");
         const fingerprint = await cursorFingerprint({ accountId: selected.account.accountId, ...normalizedQuery, limit });
         const secret = getCredentialsEncryptionSecret(env);
-        const domain = serviceDomain(env, "contacts");
+        const domain = selected.domain;
         const afterHref = await cursorAfter(cursor, domain, fingerprint, secret);
         const page = await selected.client.listContacts(normalizedQuery, afterHref, limit);
         const nextCursor = page.hasMore && page.lastHref

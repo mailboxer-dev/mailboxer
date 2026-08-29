@@ -65,6 +65,7 @@ const previewModel: AuthPageModel = {
     services: { mail: true, calendar: true, contacts: true },
     imap: { host: "", port: "993", tlsMode: "implicit", user: "" },
     smtp: { host: "", port: "587", tlsMode: "starttls", user: "", sameCredentials: true },
+    dav: { calendarUrl: "", contactsUrl: "" },
   },
 };
 
@@ -355,16 +356,51 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
                 <Hidden name="service_options_present" value="1" />
                 <div className="overflow-hidden rounded-lg border">
                   <ServiceSwitch name="enable_mail" title="Mail" checked={mail} onChange={setMail} icon={Mail} />
-                  {!isCustom ? (
-                    <>
-                      <Separator />
-                      <ServiceSwitch name="enable_calendar" title="Calendar" checked={calendar} onChange={setCalendar} icon={CalendarDays} />
-                      <Separator />
-                      <ServiceSwitch name="enable_contacts" title="Contacts" checked={contacts} onChange={setContacts} icon={ContactRound} />
-                    </>
-                  ) : null}
+                  <Separator />
+                  <ServiceSwitch name="enable_calendar" title="Calendar" checked={calendar} onChange={setCalendar} icon={CalendarDays} />
+                  <Separator />
+                  <ServiceSwitch name="enable_contacts" title="Contacts" checked={contacts} onChange={setContacts} icon={ContactRound} />
                 </div>
               </FieldSet>
+
+              {isCustom && (calendar || contacts) ? (
+                <FieldSet>
+                  <FieldLegend>Calendar and contacts</FieldLegend>
+                  <FieldGroup>
+                    {calendar ? (
+                      <Field>
+                        <FieldLabel htmlFor="caldav_url">Calendar server address</FieldLabel>
+                        <Input
+                          id="caldav_url"
+                          name="caldav_url"
+                          type="url"
+                          inputMode="url"
+                          maxLength={2_048}
+                          defaultValue={page.account.dav.calendarUrl}
+                          placeholder="https://calendar.example.com/"
+                          required
+                        />
+                      </Field>
+                    ) : null}
+                    {contacts ? (
+                      <Field>
+                        <FieldLabel htmlFor="carddav_url">Contacts server address</FieldLabel>
+                        <Input
+                          id="carddav_url"
+                          name="carddav_url"
+                          type="url"
+                          inputMode="url"
+                          maxLength={2_048}
+                          defaultValue={page.account.dav.contactsUrl}
+                          placeholder="https://contacts.example.com/"
+                          required
+                        />
+                      </Field>
+                    ) : null}
+                    <FieldDescription>Find these addresses in your provider's calendar or contacts setup guide.</FieldDescription>
+                  </FieldGroup>
+                </FieldSet>
+              ) : null}
             </FieldGroup>
 
             <div className="mt-6 flex flex-col-reverse gap-3 border-t pt-4 sm:flex-row sm:justify-between">

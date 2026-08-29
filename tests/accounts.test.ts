@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   AccountVaultError,
   addDraftAccount,
@@ -38,10 +38,9 @@ class MemoryKv {
 
 function env(kv = new MemoryKv()): AppEnv {
   return {
+    OAUTH_KV: kv as unknown as KVNamespace,
     MAIL_CREDENTIALS_KV: kv as unknown as KVNamespace,
     MAIL_CREDENTIALS_ENCRYPTION_KEY: "test-account-vault-key-that-is-at-least-32-characters",
-    CALDAV_URL: "https://caldav.icloud.com/",
-    CARDDAV_URL: "https://contacts.icloud.com/",
   } as AppEnv;
 }
 
@@ -188,6 +187,43 @@ describe("multi-account vault", () => {
     await expect(verifyAccountSubmission(environment, { ...base, imapHost: "127.0.0.1" })).rejects.toThrow(/hostname/u);
     await expect(verifyAccountSubmission(environment, { ...base, smtpPort: 25 })).rejects.toThrow(/Unsupported SMTP/u);
     await expect(verifyAccountSubmission(environment, { ...base, imapHost: "mail.local" })).rejects.toThrow(/public hostname/u);
+  });
+
+  it("stores and verifies custom calendar and contacts servers per account", async () => {
+    const davVerify = vi.fn(async () => undefined);
+    const submission = {
+      preset: "custom" as const,
+      label: "Other provider",
+      address: "me@example.com",
+      enableMail: false,
+      enableCalendar: true,
+      enableContacts: true,
+      imapHost: "imap.example.com",
+      imapPort: 993,
+      imapTlsMode: "implicit" as const,
+      imapUser: "calendar-user",
+      imapPassword: "account-password",
+      smtpHost: "smtp.example.com",
+      smtpPort: 587,
+      smtpTlsMode: "starttls" as const,
+      sameSmtpCredentials: true,
+      caldavUrl: "https://dav.example.com/calendar",
+      carddavUrl: "https://dav.example.com/contacts",
+    };
+
+    const verified = await verifyAccountSubmission(env(), submission, { davVerify });
+    expect(verified.capabilities).toEqual({ mail: false, calendar: true, contacts: true });
+    expect(verified.davConfig).toEqual({
+      caldavUrl: "https://dav.example.com/calendar/",
+      carddavUrl: "https://dav.example.com/contacts/",
+    });
+    expect(davVerify).toHaveBeenNthCalledWith(1, verified.config, verified.davConfig, "calendar");
+    expect(davVerify).toHaveBeenNthCalledWith(2, verified.config, verified.davConfig, "contacts");
+
+    await expect(verifyAccountSubmission(env(), {
+      ...submission,
+      caldavUrl: "http://127.0.0.1/calendar",
+    }, { davVerify })).rejects.toThrow(/secure public calendar server/u);
   });
 
   it("loads committed encrypted vaults", async () => {

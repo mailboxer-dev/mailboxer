@@ -112,6 +112,19 @@ describe("iCloud DAV discovery and live collection access", () => {
     expect(transcript.calls[0]?.headers.get("Authorization")).toBe("Basic b3duZXJAaWNsb3VkLmNvbTphcHAtcGFzc3dvcmQ=");
   });
 
+  it("confines custom DAV discovery to its configured host and uses its account username", async () => {
+    const transcript = new Transcript([response("", 302, { Location: "https://other.example/steal" })]);
+    const client = new DavClient(
+      { email: "owner@example.com", password: "account-password" },
+      { caldavUrl: "https://dav.example.com/", username: "dav-user" },
+      transcript.fetch,
+    );
+    await expect(client.listCalendars()).rejects.toThrow("unsafe");
+    expect(transcript.calls).toHaveLength(1);
+    expect(transcript.calls[0]?.url).toBe("https://dav.example.com/.well-known/caldav");
+    expect(transcript.calls[0]?.headers.get("Authorization")).toBe("Basic ZGF2LXVzZXI6YWNjb3VudC1wYXNzd29yZA==");
+  });
+
   it("discovers CardDAV address books and supported vCard versions", async () => {
     const transcript = new Transcript(contactBootstrapResponses());
     const client = new DavClient(credentials, caldavConfig, transcript.fetch);

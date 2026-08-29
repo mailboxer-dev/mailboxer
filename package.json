@@ -20,10 +20,10 @@
   "cloudflare": {
     "bindings": {
       "OAUTH_KV": {
-        "description": "Automatically provision a KV namespace for OAuth clients, authorization state, grants, access tokens, and refresh tokens. It must not contain mail content."
+        "description": "OAuth sessions and tokens. Give this namespace a unique name such as `<worker-name>-oauth`."
       },
       "MAIL_CREDENTIALS_KV": {
-        "description": "Automatically provision a KV namespace for encrypted per-user account vaults and short-lived reconnect drafts."
+        "description": "Encrypted account details. Give this namespace a different name such as `<worker-name>-accounts`."
       },
       "MAIL_CREDENTIALS_ENCRYPTION_KEY": {
         "description": "Encryption key for per-user account vaults. Generate with `openssl rand -hex 32`; do not reuse an email password."

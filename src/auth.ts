@@ -253,6 +253,8 @@ interface AccountFormValues {
   smtpTlsMode: "implicit" | "starttls";
   smtpUser: string;
   sameSmtpCredentials: boolean;
+  caldavUrl: string;
+  carddavUrl: string;
 }
 
 function firstValue(form: URLSearchParams | undefined, names: readonly string[]): string {
@@ -297,6 +299,8 @@ function accountFormValues(
     sameSmtpCredentials: customFieldsPresent
       ? Boolean(form?.get("same_smtp_credentials"))
       : config ? config.smtpUser === config.imapUser && config.smtpPassword === config.password : true,
+    caldavUrl: firstValue(form, ["caldav_url"]) || existing?.davConfig?.caldavUrl || "",
+    carddavUrl: firstValue(form, ["carddav_url"]) || existing?.davConfig?.carddavUrl || "",
   };
 }
 
@@ -327,6 +331,10 @@ function accountFormModel(
       tlsMode: values.smtpTlsMode,
       user: values.smtpUser,
       sameCredentials: values.sameSmtpCredentials,
+    },
+    dav: {
+      calendarUrl: values.caldavUrl,
+      contactsUrl: values.carddavUrl,
     },
   };
 }
@@ -377,6 +385,7 @@ function renderPasswordPage(
       label: "",
       imap: { host: "", port: "993", tlsMode: "implicit", user: "" },
       smtp: { host: "", port: "587", tlsMode: "starttls", user: "", sameCredentials: true },
+      dav: { calendarUrl: "", contactsUrl: "" },
     },
     ...(errorMessage ? { message: { kind: "error" as const, text: errorMessage } } : {}),
   });
@@ -514,6 +523,8 @@ function accountSubmissionFromForm(form: URLSearchParams): AccountSubmission {
     smtpUser: firstValue(form, ["smtp_user"]) || undefined,
     smtpPassword: firstValue(form, ["smtp_password"]) || undefined,
     sameSmtpCredentials: customFieldsPresent ? form.has("same_smtp_credentials") : undefined,
+    caldavUrl: firstValue(form, ["caldav_url"]) || undefined,
+    carddavUrl: firstValue(form, ["carddav_url"]) || undefined,
   };
 }
 
@@ -535,8 +546,8 @@ function accountSubmissionFromStored(account: StoredMailAccount): AccountSubmiss
     label: account.label,
     address: account.address,
     enableMail: account.capabilities.mail,
-    enableCalendar: false,
-    enableContacts: false,
+    enableCalendar: account.capabilities.calendar,
+    enableContacts: account.capabilities.contacts,
     imapHost: config.imapHost,
     imapPort: config.imapPort,
     imapTlsMode: config.imapTlsMode,
@@ -548,6 +559,8 @@ function accountSubmissionFromStored(account: StoredMailAccount): AccountSubmiss
     smtpUser: config.smtpUser,
     smtpPassword: config.smtpPassword,
     sameSmtpCredentials: config.smtpUser === config.imapUser && config.smtpPassword === config.password,
+    caldavUrl: account.davConfig?.caldavUrl,
+    carddavUrl: account.davConfig?.carddavUrl,
   };
 }
 

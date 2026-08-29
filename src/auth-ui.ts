@@ -32,6 +32,10 @@ export interface AccountFormModel {
     user: string;
     sameCredentials: boolean;
   };
+  dav: {
+    calendarUrl: string;
+    contactsUrl: string;
+  };
 }
 
 interface AuthPageBase {

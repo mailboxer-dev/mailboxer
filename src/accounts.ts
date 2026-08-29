@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getCredentialsEncryptionSecret, getDavConfig, getMailConfig } from "./config";
+import { getCredentialsEncryptionSecret, getMailConfig } from "./config";
 import {
   credentialIdForEmail,
   loadMailCredentials,
@@ -11,6 +11,7 @@ import { logFailure } from "./diagnostics";
 import { ImapClient } from "./imap/client";
 import { SmtpClient } from "./smtp/client";
 import { withSpan } from "./tracing";
+import { customDavConfig, ICLOUD_DAV_CONFIG } from "./providers";
 import type {
   AccountCapability,
   AccountSummary,
@@ -18,6 +19,7 @@ import type {
   AppEnv,
   AuthProps,
   MailConfig,
+  DavConfig,
   StoredMailAccount,
 } from "./types";
 
@@ -61,6 +63,10 @@ const storedAccountSchema = z.object({
   address: z.string().email().max(320),
   capabilities: capabilitiesSchema,
   config: mailConfigSchema,
+  davConfig: z.object({
+    caldavUrl: z.string().url().optional(),
+    carddavUrl: z.string().url().optional(),
+  }).optional(),
 });
 const vaultSchema = z.object({
   version: z.literal(2),
@@ -108,12 +114,14 @@ export interface AccountSubmission {
   smtpUser?: string;
   smtpPassword?: string;
   sameSmtpCredentials?: boolean;
+  caldavUrl?: string;
+  carddavUrl?: string;
 }
 
 export interface VerifyAccountDependencies {
   imapOpen?: typeof ImapClient.open;
   smtpOpen?: typeof SmtpClient.open;
-  davVerify?: (config: MailConfig, service: "calendar" | "contacts") => Promise<void>;
+  davVerify?: (config: MailConfig, davConfig: DavConfig, service: "calendar" | "contacts") => Promise<void>;
 }
 
 export class AccountVaultError extends Error {
@@ -222,8 +230,8 @@ function assertTransport(port: number, mode: "implicit" | "starttls", service: "
 function capabilitiesFor(submission: AccountSubmission): StoredMailAccount["capabilities"] {
   const capabilities = {
     mail: submission.enableMail !== false,
-    calendar: submission.preset === "icloud" && submission.enableCalendar === true,
-    contacts: submission.preset === "icloud" && submission.enableContacts === true,
+    calendar: submission.enableCalendar === true,
+    contacts: submission.enableContacts === true,
   };
   if (!capabilities.mail && !capabilities.calendar && !capabilities.contacts) {
     throw new AccountVaultError("Enable at least one service for this account");
@@ -261,8 +269,8 @@ function customConfig(submission: AccountSubmission): MailConfig {
 
 async function verifyConfig(
   config: MailConfig,
+  davConfig: DavConfig,
   capabilities: StoredMailAccount["capabilities"],
-  env: AppEnv,
   dependencies: VerifyAccountDependencies,
 ): Promise<void> {
   if (capabilities.mail) {
@@ -294,11 +302,18 @@ async function verifyConfig(
       throw new AccountVaultError("The account credentials could not be verified");
     }
   }
-  const davVerify = dependencies.davVerify ?? ((candidate: MailConfig, service: "calendar" | "contacts") => (
-    new DavClient(candidate, getDavConfig(env)).verifyService(service)
+  const davVerify = dependencies.davVerify ?? ((candidate: MailConfig, candidateDav: DavConfig, service: "calendar" | "contacts") => (
+    new DavClient(candidate, candidateDav).verifyService(service)
   ));
-  if (capabilities.calendar) await davVerify(config, "calendar");
-  if (capabilities.contacts) await davVerify(config, "contacts");
+  for (const service of ["calendar", "contacts"] as const) {
+    if (!capabilities[service]) continue;
+    try {
+      await davVerify(config, davConfig, service);
+    } catch (error) {
+      logFailure("account_verification_failed", { service, preset: "custom" }, error);
+      throw new AccountVaultError(`The ${service} account could not be verified`);
+    }
+  }
 }
 
 export async function verifyAccountSubmission(
@@ -311,6 +326,7 @@ export async function verifyAccountSubmission(
   const address = normalizeAddress(z.string().trim().email().max(320).parse(submission.address));
   const capabilities = capabilitiesFor(submission);
   let config: MailConfig;
+  let davConfig: DavConfig | undefined;
   if (submission.preset === "icloud") {
     const scopes = [
       ...(capabilities.mail ? ["mail.read", "mail.write"] : []),
@@ -321,13 +337,24 @@ export async function verifyAccountSubmission(
       env,
       { email: address, appPassword: submission.appPassword ?? "" },
       scopes,
-      dependencies,
+      {
+        imapOpen: dependencies.imapOpen,
+        smtpOpen: dependencies.smtpOpen,
+        ...(dependencies.davVerify ? {
+          davVerify: (candidate, service) => dependencies.davVerify?.(candidate, ICLOUD_DAV_CONFIG, service) ?? Promise.resolve(),
+        } : {}),
+      },
     );
     config = getMailConfig(env, verified);
+    davConfig = ICLOUD_DAV_CONFIG;
   } else {
-    if (capabilities.calendar || capabilities.contacts) throw new AccountVaultError("Custom DAV servers are not supported");
     config = customConfig(submission);
-    await verifyConfig(config, capabilities, env, dependencies);
+    try {
+      davConfig = customDavConfig(submission.caldavUrl, submission.carddavUrl, capabilities);
+    } catch (error) {
+      throw new AccountVaultError(error instanceof Error ? error.message : "Enter valid calendar and contacts server addresses");
+    }
+    await verifyConfig(config, davConfig ?? {}, capabilities, dependencies);
   }
   return storedAccountSchema.parse({
     accountId: existingAccountId ?? randomId("acct_"),
@@ -336,6 +363,7 @@ export async function verifyAccountSubmission(
     address,
     capabilities,
     config,
+    ...(submission.preset === "custom" && davConfig ? { davConfig } : {}),
   });
 }
 

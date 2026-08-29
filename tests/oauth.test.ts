@@ -1,6 +1,6 @@
 import type { AuthRequest, CompleteAuthorizationOptions, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { describe, expect, it, vi } from "vitest";
-import { commitAccountDraft, newAccountDraft } from "../src/accounts";
+import { commitAccountDraft, newAccountDraft, type AccountSubmission } from "../src/accounts";
 import { createCredentialAuthHandler, type CredentialAuthDependencies } from "../src/auth";
 import { decodeAuthPageModel, type AuthPageModel } from "../src/auth-ui";
 import { MailCredentialError } from "../src/credentials";
@@ -80,8 +80,6 @@ function oauthEnv(options: {
     OAUTH_KV: (options.oauthKv ?? new MemoryKv()) as unknown as KVNamespace,
     MAIL_CREDENTIALS_KV: (options.credentialsKv ?? new MemoryKv()) as unknown as KVNamespace,
     OAUTH_PROVIDER: helpers,
-    CALDAV_URL: "https://caldav.icloud.com/",
-    CARDDAV_URL: "https://contacts.icloud.com/",
     MAIL_CREDENTIALS_ENCRYPTION_KEY: options.encryptionKey ?? "a-secure-test-encryption-key-with-32-chars",
   };
 }
@@ -210,7 +208,7 @@ describe("multi-account OAuth authorization", () => {
   it("rejects an unbound cross-site POST but accepts the same-origin cookie fallback", async () => {
     const oauthKv = new MemoryKv();
     const environment = oauthEnv({ oauthKv });
-    const verify = vi.fn(async () => account());
+    const verify = vi.fn(async (_env: AppEnv, _submission: AccountSubmission) => account());
     const authFetch = authFetchFor({ verifyAccountSubmission: verify });
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state } = stateAndCookie(authorize);
@@ -239,7 +237,48 @@ describe("multi-account OAuth authorization", () => {
       expect(model.step).toBe("config");
       expect(model.account.address).toBe("person@example.com");
       expect(model.account.preset).toBe("custom");
+      expect(model.account.dav).toEqual({ calendarUrl: "", contactsUrl: "" });
     }
+  });
+
+  it("passes custom calendar and contacts server addresses to account verification", async () => {
+    const verify = vi.fn(async (_env: AppEnv, _submission: AccountSubmission) => account());
+    const environment = oauthEnv();
+    const authFetch = authFetchFor({ verifyAccountSubmission: verify });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
+    const { state, cookie } = stateAndCookie(authorize);
+    await authFetch(lookupForm(state, cookie, "person@example.com"), environment, context);
+
+    const response = await authFetch(post(state, cookie, {
+      action: "verify",
+      target: "start",
+      preset: "custom",
+      label: "Other provider",
+      address: "person@example.com",
+      service_options_present: "1",
+      enable_calendar: "1",
+      enable_contacts: "1",
+      custom_fields_present: "1",
+      imap_host: "imap.example.com",
+      imap_port: "993",
+      imap_tls_mode: "implicit",
+      imap_user: "person",
+      imap_password: "password",
+      smtp_host: "smtp.example.com",
+      smtp_port: "587",
+      smtp_tls_mode: "starttls",
+      same_smtp_credentials: "1",
+      caldav_url: "https://dav.example.com/calendar/",
+      carddav_url: "https://dav.example.com/contacts/",
+    }), environment, context);
+
+    expect(response.status).toBe(200);
+    expect(verify.mock.calls[0]?.[1]).toMatchObject({
+      enableCalendar: true,
+      enableContacts: true,
+      caldavUrl: "https://dav.example.com/calendar/",
+      carddavUrl: "https://dav.example.com/contacts/",
+    });
   });
 
   it("creates an encrypted draft, commits it on Continue, and issues opaque v2 props", async () => {
