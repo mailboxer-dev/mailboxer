@@ -33,7 +33,6 @@ export const restrictMailPropsToTokenScope = restrictPropsToTokenScope;
 
 export type AppEnv = Env & {
   OAUTH_PROVIDER: OAuthHelpers;
-  MAIL_CREDENTIALS_KV: KVNamespace;
   MAIL_CREDENTIALS_ENCRYPTION_KEY: string;
 };
 

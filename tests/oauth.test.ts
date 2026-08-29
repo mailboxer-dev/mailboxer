@@ -61,8 +61,7 @@ function account(seed = "primary"): StoredMailAccount {
 }
 
 function oauthEnv(options: {
-  oauthKv?: MemoryKv;
-  credentialsKv?: MemoryKv;
+  kv?: MemoryKv;
   complete?: OAuthHelpers["completeAuthorization"];
   encryptionKey?: string;
 } = {}): AppEnv {
@@ -78,8 +77,7 @@ function oauthEnv(options: {
     completeAuthorization: options.complete ?? (async () => ({ redirectTo: "http://127.0.0.1:6274/oauth/callback?code=local" })),
   } as unknown as OAuthHelpers;
   return {
-    OAUTH_KV: (options.oauthKv ?? new MemoryKv()) as unknown as KVNamespace,
-    MAIL_CREDENTIALS_KV: (options.credentialsKv ?? new MemoryKv()) as unknown as KVNamespace,
+    OAUTH_KV: (options.kv ?? new MemoryKv()) as unknown as KVNamespace,
     OAUTH_PROVIDER: helpers,
     MAIL_CREDENTIALS_ENCRYPTION_KEY: options.encryptionKey ?? "a-secure-test-encryption-key-with-32-chars",
   };
@@ -274,8 +272,8 @@ describe("multi-account OAuth authorization", () => {
   });
 
   it("renders the React authorization shell without permissions or credentials", async () => {
-    const oauthKv = new MemoryKv();
-    const response = await authFetchFor()(new Request("https://mcp.example/authorize"), oauthEnv({ oauthKv }), context);
+    const kv = new MemoryKv();
+    const response = await authFetchFor()(new Request("https://mcp.example/authorize"), oauthEnv({ kv }), context);
     const body = await response.text();
     expect(response.status).toBe(200);
     expect(body).toContain("/auth.js");
@@ -299,7 +297,7 @@ describe("multi-account OAuth authorization", () => {
     expect(initialCsp).not.toContain("tenant=one");
     expect(response.headers.get("Set-Cookie")).toContain("HttpOnly");
     expect(response.headers.get("Set-Cookie")).toContain("Path=/authorize");
-    expect(oauthKv.values.size).toBe(1);
+    expect(kv.values.size).toBe(1);
   });
 
   it("omits CSP only for local HTTP development origins", async () => {
@@ -315,8 +313,8 @@ describe("multi-account OAuth authorization", () => {
   });
 
   it("rejects an unbound cross-site POST but accepts the same-origin cookie fallback", async () => {
-    const oauthKv = new MemoryKv();
-    const environment = oauthEnv({ oauthKv });
+    const kv = new MemoryKv();
+    const environment = oauthEnv({ kv });
     const verify = vi.fn(async (_env: AppEnv, _submission: AccountSubmission) => account());
     const authFetch = authFetchFor({ verifyAccountSubmission: verify });
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
@@ -463,10 +461,9 @@ describe("multi-account OAuth authorization", () => {
   });
 
   it("creates an encrypted draft, commits it on Continue, and issues opaque v2 props", async () => {
-    const oauthKv = new MemoryKv();
-    const credentialsKv = new MemoryKv();
+    const kv = new MemoryKv();
     const complete = vi.fn(async (_options: CompleteAuthorizationOptions) => ({ redirectTo: "http://127.0.0.1:6274/oauth/callback?code=issued" }));
-    const environment = oauthEnv({ oauthKv, credentialsKv, complete });
+    const environment = oauthEnv({ kv, complete });
     const authFetch = authFetchFor({ verifyAccountSubmission: vi.fn(async () => account()) });
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
@@ -485,7 +482,11 @@ describe("multi-account OAuth authorization", () => {
     const verifiedPage = await pageModel(verified);
     expect(verifiedPage.kind).toBe("management");
     expect(verifiedPage.message?.text).toContain("Account added");
-    expect([...credentialsKv.values.values()].join("\n")).not.toContain("app-password");
+    expect([...kv.values.values()].join("\n")).not.toContain("app-password");
+    expect([...kv.values.keys()]).toEqual(expect.arrayContaining([
+      `mail-oauth:state:${state}`,
+      `mail:account-draft:v2:${state}`,
+    ]));
 
     const response = await authFetch(post(state, cookie, { action: "continue" }, ["mail.read", "offline_access"]), environment, context);
     expect(response.status).toBe(302);
@@ -497,13 +498,16 @@ describe("multi-account OAuth authorization", () => {
     expect(options.scope).toEqual(["mail.read", "mail.write", "offline_access"]);
     expect(options.props).toEqual({ userId: options.userId, scopes: ["mail.read", "mail.write"] });
     expect(JSON.stringify(options.props)).not.toContain("icloud.com");
-    expect(oauthKv.values.size).toBe(0);
+    expect([...kv.values.keys()].some((key) => key.startsWith("mail-oauth:state:"))).toBe(false);
+    expect([...kv.values.keys()].some((key) => key.startsWith("mail:account-draft:v2:"))).toBe(false);
+    expect([...kv.values.keys()].some((key) => key.startsWith("mail:account-vault:v2:"))).toBe(true);
+    expect([...kv.values.keys()].some((key) => key.startsWith("mail:account-index:v2:"))).toBe(true);
+    expect([...kv.values.keys()].some((key) => key.startsWith("mail:account-email-index:v2:"))).toBe(true);
   });
 
   it("unlocks an existing profile by matching the saved password without live verification", async () => {
-    const oauthKv = new MemoryKv();
-    const credentialsKv = new MemoryKv();
-    const environment = oauthEnv({ oauthKv, credentialsKv });
+    const kv = new MemoryKv();
+    const environment = oauthEnv({ kv });
     const vault = await commitAccountDraft(environment, newAccountDraft(account()));
     const verify = vi.fn(async () => account());
     const authFetch = authFetchFor({ verifyAccountSubmission: verify });
@@ -534,8 +538,8 @@ describe("multi-account OAuth authorization", () => {
   });
 
   it("rejects a wrong saved password without live verification", async () => {
-    const credentialsKv = new MemoryKv();
-    const environment = oauthEnv({ credentialsKv });
+    const kv = new MemoryKv();
+    const environment = oauthEnv({ kv });
     const vault = await commitAccountDraft(environment, newAccountDraft(account()));
     const verify = vi.fn(async () => account());
     const authFetch = authFetchFor({ verifyAccountSubmission: verify });
@@ -550,8 +554,8 @@ describe("multi-account OAuth authorization", () => {
   });
 
   it("reuses the saved iCloud password while live-verifying an account edit", async () => {
-    const credentialsKv = new MemoryKv();
-    const environment = oauthEnv({ credentialsKv });
+    const kv = new MemoryKv();
+    const environment = oauthEnv({ kv });
     const vault = await commitAccountDraft(environment, newAccountDraft(account()));
     const verify = vi.fn(async (_env, submission) => ({
       ...account(),
@@ -604,9 +608,9 @@ describe("multi-account OAuth authorization", () => {
   });
 
   it("denies authorization and deletes OAuth state and account drafts", async () => {
-    const oauthKv = new MemoryKv();
-    const credentialsKv = new MemoryKv();
-    const environment = oauthEnv({ oauthKv, credentialsKv });
+    const kv = new MemoryKv();
+    await kv.put("mail:credentials:v1:sentinel", "keep");
+    const environment = oauthEnv({ kv });
     const authFetch = authFetchFor({ verifyAccountSubmission: vi.fn(async () => account()) });
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
@@ -615,8 +619,9 @@ describe("multi-account OAuth authorization", () => {
     const denied = await authFetch(post(state, cookie, { decision: "deny" }, []), environment, context);
     expect(denied.status).toBe(302);
     expect(denied.headers.get("Location")).toContain("error=access_denied");
-    expect(oauthKv.values.size).toBe(0);
-    expect([...credentialsKv.values.keys()].some((key) => key.includes("draft"))).toBe(false);
+    expect(kv.values.has("mail:credentials:v1:sentinel")).toBe(true);
+    expect([...kv.values.keys()].some((key) => key.startsWith("mail-oauth:state:"))).toBe(false);
+    expect([...kv.values.keys()].some((key) => key.startsWith("mail:account-draft:v2:"))).toBe(false);
   });
 
   it("returns a configuration error when the encryption secret is invalid", async () => {

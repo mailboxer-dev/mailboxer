@@ -423,7 +423,7 @@ export function newAccountDraft(account: StoredMailAccount): AccountDraft {
 export async function loadAccountVault(env: AppEnv, userId: string): Promise<AccountVaultV2 | null> {
   if (!userIdSchema.safeParse(userId).success) return null;
   const key = `${VAULT_KEY_PREFIX}${userId}`;
-  const value = await env.MAIL_CREDENTIALS_KV.get(key);
+  const value = await env.OAUTH_KV.get(key);
   if (!value) return null;
   const decrypted = await decryptRecord(value, key, getCredentialsEncryptionSecret(env));
   return validateVault(vaultSchema.parse(decrypted));
@@ -433,18 +433,18 @@ export async function saveAccountDraft(env: AppEnv, state: string, draft: Accoun
   const parsed = draftSchema.parse(draft);
   const key = `${DRAFT_KEY_PREFIX}${state}`;
   const encrypted = await encryptRecord(parsed, key, getCredentialsEncryptionSecret(env));
-  await env.MAIL_CREDENTIALS_KV.put(key, encrypted, { expirationTtl: ACCOUNT_DRAFT_TTL_SECONDS });
+  await env.OAUTH_KV.put(key, encrypted, { expirationTtl: ACCOUNT_DRAFT_TTL_SECONDS });
 }
 
 export async function loadAccountDraft(env: AppEnv, state: string): Promise<AccountDraft | null> {
   const key = `${DRAFT_KEY_PREFIX}${state}`;
-  const value = await env.MAIL_CREDENTIALS_KV.get(key);
+  const value = await env.OAUTH_KV.get(key);
   if (!value) return null;
   return draftSchema.parse(await decryptRecord(value, key, getCredentialsEncryptionSecret(env)));
 }
 
 export async function deleteAccountDraft(env: AppEnv, state: string): Promise<void> {
-  await env.MAIL_CREDENTIALS_KV.delete(`${DRAFT_KEY_PREFIX}${state}`);
+  await env.OAUTH_KV.delete(`${DRAFT_KEY_PREFIX}${state}`);
 }
 
 function draftFromVault(vault: AccountVaultV2): AccountDraft {
@@ -492,11 +492,11 @@ export async function findAccountDraftByEmail(env: AppEnv, email: string): Promi
   const normalizedEmail = normalizeAddress(parsedEmail.data);
   const secret = getCredentialsEncryptionSecret(env);
 
-  const owner = await env.MAIL_CREDENTIALS_KV.get(await emailIndexKey(normalizedEmail, secret));
+  const owner = await env.OAUTH_KV.get(await emailIndexKey(normalizedEmail, secret));
   if (owner) return loadDraftForOwner(env, owner);
 
   // Older v2 iCloud accounts only have the locator index, which is also email-based.
-  const legacyLocatorOwner = await env.MAIL_CREDENTIALS_KV.get(
+  const legacyLocatorOwner = await env.OAUTH_KV.get(
     await locatorIndexKey(`icloud\u0000${normalizedEmail}`, secret),
   );
   if (legacyLocatorOwner) return loadDraftForOwner(env, legacyLocatorOwner);
@@ -524,17 +524,17 @@ export async function commitAccountDraft(env: AppEnv, draft: AccountDraft): Prom
     const nextEmailKeys = [...new Set(await Promise.all(vault.accounts.map((account) => emailIndexKey(account.address, secret))))];
     const nextKeys = [...new Set([...nextLocatorKeys, ...nextEmailKeys])];
     for (const key of nextKeys) {
-      const owner = await env.MAIL_CREDENTIALS_KV.get(key);
+      const owner = await env.OAUTH_KV.get(key);
       if (owner && owner !== vault.userId) throw new AccountVaultError("This upstream account is already attached to another profile");
     }
     const vaultKey = `${VAULT_KEY_PREFIX}${vault.userId}`;
-    await env.MAIL_CREDENTIALS_KV.put(vaultKey, await encryptRecord(vault, vaultKey, secret));
-    await Promise.all(nextKeys.map((key) => env.MAIL_CREDENTIALS_KV.put(key, vault.userId)));
+    await env.OAUTH_KV.put(vaultKey, await encryptRecord(vault, vaultKey, secret));
+    await Promise.all(nextKeys.map((key) => env.OAUTH_KV.put(key, vault.userId)));
     if (existing) {
       const oldLocatorKeys = await Promise.all(existing.accounts.map((account) => indexKey(account, secret)));
       const oldEmailKeys = [...new Set(await Promise.all(existing.accounts.map((account) => emailIndexKey(account.address, secret))))];
       const oldKeys = [...new Set([...oldLocatorKeys, ...oldEmailKeys])];
-      await Promise.all(oldKeys.filter((key) => !nextKeys.includes(key)).map((key) => env.MAIL_CREDENTIALS_KV.delete(key)));
+      await Promise.all(oldKeys.filter((key) => !nextKeys.includes(key)).map((key) => env.OAUTH_KV.delete(key)));
     }
     return vault;
   });
@@ -542,7 +542,7 @@ export async function commitAccountDraft(env: AppEnv, draft: AccountDraft): Prom
 
 export async function findAccountDraft(env: AppEnv, verifiedAccount: StoredMailAccount): Promise<AccountDraft | null> {
   const secret = getCredentialsEncryptionSecret(env);
-  const owner = await env.MAIL_CREDENTIALS_KV.get(await indexKey(verifiedAccount, secret));
+  const owner = await env.OAUTH_KV.get(await indexKey(verifiedAccount, secret));
   if (owner) {
     return loadDraftForOwner(env, owner);
   }

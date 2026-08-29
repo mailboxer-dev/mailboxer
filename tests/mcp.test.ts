@@ -24,10 +24,9 @@ class MemoryKv {
   }
 }
 
-function testEnv(credentialsKv: KVNamespace = {} as KVNamespace): AppEnv {
+function testEnv(kv: KVNamespace = new MemoryKv() as unknown as KVNamespace): AppEnv {
   return {
-    OAUTH_KV: {} as KVNamespace,
-    MAIL_CREDENTIALS_KV: credentialsKv,
+    OAUTH_KV: kv,
     OAUTH_PROVIDER: {} as OAuthHelpers,
     MAIL_CREDENTIALS_ENCRYPTION_KEY: "a-secure-test-encryption-key-with-32-chars",
   };
@@ -122,8 +121,8 @@ describe("stateless MCP handler", () => {
   });
 
   it("advertises account selection on every resource tool and lists a v2 account vault", async () => {
-    const credentialsKv = new MemoryKv();
-    const environment = testEnv(credentialsKv as unknown as KVNamespace);
+    const kv = new MemoryKv();
+    const environment = testEnv(kv as unknown as KVNamespace);
     const configured = {
       accountId: "acct_aaaaaaaaaaaaaaaaaaaaaa",
       label: "Personal",
@@ -171,8 +170,8 @@ describe("stateless MCP handler", () => {
   });
 
   it("invokes a DAV tool through the stateless handler with the encrypted credential record", async () => {
-    const credentialsKv = new MemoryKv();
-    const environment = testEnv(credentialsKv as unknown as KVNamespace);
+    const kv = new MemoryKv();
+    const environment = testEnv(kv as unknown as KVNamespace);
     const credentialId = await storeMailCredentials(environment, {
       email: "owner@icloud.com",
       imapUser: "owner",

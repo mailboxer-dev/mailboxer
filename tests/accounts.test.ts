@@ -39,7 +39,6 @@ class MemoryKv {
 function env(kv = new MemoryKv()): AppEnv {
   return {
     OAUTH_KV: kv as unknown as KVNamespace,
-    MAIL_CREDENTIALS_KV: kv as unknown as KVNamespace,
     MAIL_CREDENTIALS_ENCRYPTION_KEY: "test-account-vault-key-that-is-at-least-32-characters",
   } as AppEnv;
 }

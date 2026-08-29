@@ -41,9 +41,6 @@
   "kv_namespaces": [
     {
       "binding": "OAUTH_KV"
-    },
-    {
-      "binding": "MAIL_CREDENTIALS_KV"
     }
   ]
 }

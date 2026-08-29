@@ -1,5 +1,5 @@
 # Signs OAuth authorization state and derives the encryption key for the
-# encrypted multi-account credential vault in MAIL_CREDENTIALS_KV.
+# encrypted multi-account credential vault in the shared OAUTH_KV namespace.
 # Account credentials, including custom IMAP/SMTP credentials, are entered
 # through the /authorize page and are not configured in this file.
 # Generate with: openssl rand -hex 32

@@ -101,9 +101,9 @@ function credentialKey(credentialId: string): string {
   return `${CREDENTIAL_KEY_PREFIX}${credentialId}`;
 }
 
-function credentialsKv(env: Pick<AppEnv, "MAIL_CREDENTIALS_KV">): KVNamespace {
-  if (!env.MAIL_CREDENTIALS_KV) throw new Error("MAIL_CREDENTIALS_KV binding is not configured");
-  return env.MAIL_CREDENTIALS_KV;
+function credentialsKv(env: Pick<AppEnv, "OAUTH_KV">): KVNamespace {
+  if (!env.OAUTH_KV) throw new Error("OAUTH_KV binding is not configured");
+  return env.OAUTH_KV;
 }
 
 async function encryptionKey(secret: string): Promise<CryptoKey> {
