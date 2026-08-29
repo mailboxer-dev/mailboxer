@@ -14,8 +14,9 @@ import {
 import type {
   AuthPageModel,
   TlsMode,
+  UiPageModel,
 } from "../src/auth-ui";
-import { decodeAuthPageModel } from "../src/auth-ui";
+import { decodeUiPageModel } from "../src/auth-ui";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -48,6 +49,7 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { LandingPage } from "@/landing";
 import "./styles.css";
 
 const previewModel: AuthPageModel = {
@@ -522,12 +524,13 @@ function ManagementPage({ page }: { page: Extract<AuthPageModel, { kind: "manage
   );
 }
 
-function App({ page }: { page: AuthPageModel }) {
+function App({ page }: { page: UiPageModel }) {
+  if (page.kind === "landing") return <LandingPage page={page} />;
   return page.kind === "management" ? <ManagementPage page={page} /> : <AccountForm page={page} />;
 }
 
 const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("Missing authorization UI root");
 const encodedModel = rootElement.dataset.page;
-const page = encodedModel ? decodeAuthPageModel(encodedModel) : previewModel;
+const page = encodedModel ? decodeUiPageModel(encodedModel) : previewModel;
 createRoot(rootElement).render(<StrictMode><App page={page} /></StrictMode>);

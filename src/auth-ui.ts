@@ -39,6 +39,21 @@ export interface AccountFormModel {
   };
 }
 
+/**
+ * Data used by the public onboarding page.
+ *
+ * Keep this model deliberately small: the page is rendered by the same
+ * bundled React entrypoint as the authorization wizard, but it does not need
+ * to know anything about OAuth state or account credentials.
+ */
+export interface LandingPageModel {
+  version: 1;
+  kind: "landing";
+  origin: string;
+  mcpUrl: string;
+  agentSetupUrl: string;
+}
+
 interface AuthPageBase {
   version: 1;
   clientName: string;
@@ -75,6 +90,8 @@ export type AuthPageModel =
       }>;
     });
 
+export type UiPageModel = LandingPageModel | AuthPageModel;
+
 function base64UrlEncodeUtf8(value: string): string {
   const bytes = new TextEncoder().encode(value);
   let binary = "";
@@ -82,19 +99,37 @@ function base64UrlEncodeUtf8(value: string): string {
   return btoa(binary).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/gu, "");
 }
 
-export function decodeAuthPageModel(value: string): AuthPageModel {
+function decodePageModel(value: string): UiPageModel {
   const normalized = value.replace(/-/gu, "+").replace(/_/gu, "/");
   const binary = atob(normalized + "=".repeat((4 - (normalized.length % 4)) % 4));
   const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  return JSON.parse(new TextDecoder().decode(bytes)) as AuthPageModel;
+  return JSON.parse(new TextDecoder().decode(bytes)) as UiPageModel;
+}
+
+export function decodeUiPageModel(value: string): UiPageModel {
+  return decodePageModel(value);
+}
+
+export function decodeAuthPageModel(value: string): AuthPageModel {
+  // Keep the original decoder's permissive behavior for authorization
+  // callers. New callers that need to distinguish the public page should use
+  // decodeUiPageModel instead.
+  return decodePageModel(value) as AuthPageModel;
 }
 
 function escapeAttribute(value: string): string {
   return value.replace(/&/gu, "&amp;").replace(/"/gu, "&quot;").replace(/</gu, "&lt;").replace(/>/gu, "&gt;");
 }
 
-export function renderAuthPage(page: AuthPageModel): string {
+export function renderUiPage(page: UiPageModel): string {
   const model = escapeAttribute(base64UrlEncodeUtf8(JSON.stringify(page)));
+  const title = page.kind === "landing" ? "Mailboxer — connect your agent" : page.title;
+  const description = page.kind === "landing"
+    ? "Give your agent a mailbox. Connect your email, calendar, and contacts to ChatGPT, Claude, or Codex with Mailboxer."
+    : undefined;
+  const noScriptMessage = page.kind === "landing"
+    ? "This onboarding page requires JavaScript."
+    : "This authorization screen requires JavaScript.";
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -102,14 +137,20 @@ export function renderAuthPage(page: AuthPageModel): string {
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <meta name="color-scheme" content="light">
     <meta name="theme-color" content="#062b66">
-    <title>${escapeAttribute(page.title)}</title>
+    ${description ? `<meta name="description" content="${escapeAttribute(description)}">` : ""}
+    <title>${escapeAttribute(title)}</title>
     <link rel="icon" type="image/png" href="/favicon.png">
     <link rel="stylesheet" href="/style.css">
   </head>
   <body>
     <div id="root" data-page="${model}"></div>
-    <noscript>This authorization screen requires JavaScript.</noscript>
+    <noscript>${noScriptMessage}</noscript>
     <script type="module" src="/auth.js"></script>
   </body>
 </html>`;
+}
+
+/** Render an authorization page while retaining the pre-onboarding API. */
+export function renderAuthPage(page: AuthPageModel): string {
+  return renderUiPage(page);
 }
