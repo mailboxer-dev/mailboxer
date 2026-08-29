@@ -1,9 +1,10 @@
 import type { AuthRequest, CompleteAuthorizationOptions, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { describe, expect, it, vi } from "vitest";
-import { commitAccountDraft, newAccountDraft, type AccountSubmission } from "../src/accounts";
+import { AccountVaultError, commitAccountDraft, newAccountDraft, type AccountSubmission } from "../src/accounts";
 import { createCredentialAuthHandler, type CredentialAuthDependencies } from "../src/auth";
 import { decodeAuthPageModel, type AuthPageModel } from "../src/auth-ui";
 import { MailCredentialError } from "../src/credentials";
+import type { DiscoveredAccountSettings } from "../src/discovery/types";
 import { restrictMailPropsToTokenScope, type AppEnv, type StoredMailAccount } from "../src/types";
 
 class MemoryKv {
@@ -150,6 +151,35 @@ function unlockForm(state: string, cookie: string | undefined, accountId: string
   });
 }
 
+function discoverForm(state: string, cookie: string | undefined, address = "person@example.com", password = "account-password", target = "start"): Request {
+  return post(state, cookie, {
+    action: "discover",
+    target,
+    address,
+    new_account_password: password,
+  });
+}
+
+function discoveredSettings(address = "person@example.com"): DiscoveredAccountSettings {
+  return {
+    providerName: "Example Mail",
+    mail: {
+      imapHost: "imap.example.com",
+      imapPort: 993,
+      imapTlsMode: "implicit",
+      imapUser: address,
+      smtpHost: "smtp.example.com",
+      smtpPort: 587,
+      smtpTlsMode: "starttls",
+      smtpUser: address,
+    },
+    caldavUrl: "https://dav.example.com/",
+    carddavUrl: "https://dav.example.com/",
+    davUser: address,
+    sources: ["provider_autoconfig", "well_known"],
+  };
+}
+
 const context = {} as ExecutionContext;
 
 describe("multi-account OAuth authorization", () => {
@@ -224,7 +254,7 @@ describe("multi-account OAuth authorization", () => {
     expect((await authFetch(crossSite, environment, context)).status).toBe(400);
   });
 
-  it("shows account settings only after checking a new email and detects its provider", async () => {
+  it("asks only for a password after checking a new email and detects its provider", async () => {
     const environment = oauthEnv();
     const authFetch = authFetchFor();
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
@@ -234,10 +264,11 @@ describe("multi-account OAuth authorization", () => {
     const model = await pageModel(response);
     expect(model.kind).toBe("account-form");
     if (model.kind === "account-form") {
-      expect(model.step).toBe("config");
+      expect(model.step).toBe("new-password");
       expect(model.account.address).toBe("person@example.com");
       expect(model.account.preset).toBe("custom");
-      expect(model.account.dav).toEqual({ calendarUrl: "", contactsUrl: "" });
+      expect(model.account.dav).toEqual({ calendarUrl: "", contactsUrl: "", user: "person@example.com" });
+      expect(JSON.stringify(model)).not.toContain("imap.example.com");
     }
   });
 
@@ -281,6 +312,77 @@ describe("multi-account OAuth authorization", () => {
     });
   });
 
+  it("discovers and verifies every available service before opening the account list", async () => {
+    const discover = vi.fn(async (address: string) => discoveredSettings(address));
+    const verify = vi.fn(async (_env: AppEnv, submission: AccountSubmission) => ({
+      ...account(),
+      preset: "custom" as const,
+      label: submission.label,
+      address: submission.address,
+      capabilities: {
+        mail: submission.enableMail === true,
+        calendar: submission.enableCalendar === true,
+        contacts: submission.enableContacts === true,
+      },
+    }));
+    const environment = oauthEnv();
+    const authFetch = authFetchFor({ discoverAccountSettings: discover, verifyAccountSubmission: verify });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
+    const { state, cookie } = stateAndCookie(authorize);
+    await authFetch(lookupForm(state, cookie, "person@example.com"), environment, context);
+
+    const response = await authFetch(discoverForm(state, cookie), environment, context);
+    const model = await pageModel(response);
+    expect(response.status).toBe(200);
+    expect(model.kind).toBe("management");
+    expect(discover).toHaveBeenCalledWith("person@example.com");
+    expect(verify.mock.calls[0]?.[1]).toMatchObject({
+      preset: "custom",
+      label: "Example Mail",
+      address: "person@example.com",
+      enableMail: true,
+      enableCalendar: true,
+      enableContacts: true,
+      imapHost: "imap.example.com",
+      imapPassword: "account-password",
+      smtpHost: "smtp.example.com",
+      sameSmtpCredentials: true,
+      caldavUrl: "https://dav.example.com/",
+      carddavUrl: "https://dav.example.com/",
+      davUser: "person@example.com",
+    });
+  });
+
+  it("shows discovered settings after verification fails without returning the password", async () => {
+    const environment = oauthEnv();
+    const authFetch = authFetchFor({
+      discoverAccountSettings: vi.fn(async (address: string) => discoveredSettings(address)),
+      verifyAccountSubmission: vi.fn(async () => { throw new AccountVaultError("We couldn't connect calendar"); }),
+    });
+    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
+    const { state, cookie } = stateAndCookie(authorize);
+    await authFetch(lookupForm(state, cookie, "person@example.com"), environment, context);
+
+    const response = await authFetch(discoverForm(state, cookie), environment, context);
+    const body = await response.clone().text();
+    const model = await pageModel(response);
+    expect(response.status).toBe(401);
+    expect(model.kind).toBe("account-form");
+    if (model.kind === "account-form") {
+      expect(model.step).toBe("config");
+      expect(model.account.imap.host).toBe("imap.example.com");
+      expect(model.account.smtp.host).toBe("smtp.example.com");
+      expect(model.account.dav).toEqual({
+        calendarUrl: "https://dav.example.com/",
+        contactsUrl: "https://dav.example.com/",
+        user: "person@example.com",
+      });
+      expect(model.message?.text).toContain("calendar");
+    }
+    expect(JSON.stringify(model)).not.toContain("account-password");
+    expect(body).not.toContain("account-password");
+  });
+
   it("creates an encrypted draft, commits it on Continue, and issues opaque v2 props", async () => {
     const oauthKv = new MemoryKv();
     const credentialsKv = new MemoryKv();
@@ -293,7 +395,7 @@ describe("multi-account OAuth authorization", () => {
     const details = await authFetch(lookupForm(state, cookie), environment, context);
     const detailsPage = await pageModel(details);
     expect(detailsPage.kind).toBe("account-form");
-    if (detailsPage.kind === "account-form") expect(detailsPage.step).toBe("config");
+    if (detailsPage.kind === "account-form") expect(detailsPage.step).toBe("new-password");
 
     const verified = await authFetch(initialAccountForm(state, cookie), environment, context);
     expect(verified.status).toBe(200);

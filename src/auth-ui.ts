@@ -1,5 +1,5 @@
 export type AccountFormTarget = "start" | "add" | "edit";
-export type AccountFormStep = "email" | "password" | "config";
+export type AccountFormStep = "email" | "password" | "new-password" | "config";
 export type AccountPreset = "icloud" | "custom";
 export type TlsMode = "implicit" | "starttls";
 
@@ -35,6 +35,7 @@ export interface AccountFormModel {
   dav: {
     calendarUrl: string;
     contactsUrl: string;
+    user: string;
   };
 }
 

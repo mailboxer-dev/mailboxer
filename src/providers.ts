@@ -41,17 +41,31 @@ function normalizedDavUrl(value: string, field: string): string {
 export function customDavConfig(
   caldavUrl: string | undefined,
   carddavUrl: string | undefined,
+  username: string | undefined,
   capabilities: Pick<StoredMailAccount["capabilities"], "calendar" | "contacts">,
 ): DavConfig | undefined {
   const config: DavConfig = {};
   if (capabilities.calendar) config.caldavUrl = normalizedDavUrl(caldavUrl ?? "", "calendar server");
   if (capabilities.contacts) config.carddavUrl = normalizedDavUrl(carddavUrl ?? "", "contacts server");
+  if (config.caldavUrl || config.carddavUrl) {
+    const normalizedUsername = username?.trim();
+    if (normalizedUsername) {
+      const hasControl = Array.from(normalizedUsername).some((character) => {
+        const code = character.codePointAt(0) ?? 0;
+        return code <= 0x1f || code === 0x7f;
+      });
+      if (normalizedUsername.length > 320 || hasControl) {
+        throw new Error("Enter a valid calendar and contacts sign-in name");
+      }
+      config.username = normalizedUsername;
+    }
+  }
   return config.caldavUrl || config.carddavUrl ? config : undefined;
 }
 
 export function davConfigForAccount(account: Pick<StoredMailAccount, "preset" | "davConfig" | "config">): DavConfig {
   if (account.preset === "icloud") return PROVIDERS.icloud.dav;
-  return { ...account.davConfig, username: account.config.imapUser };
+  return { ...account.davConfig, username: account.davConfig?.username ?? account.config.imapUser };
 }
 
 export const ICLOUD_DAV_CONFIG: DavConfig = PROVIDERS.icloud.dav;

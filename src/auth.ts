@@ -30,6 +30,8 @@ import {
 import { getCredentialsEncryptionSecret } from "./config";
 import { MailCredentialError } from "./credentials";
 import { logFailure } from "./diagnostics";
+import { AccountDiscoveryError, discoverAccountSettings } from "./discovery";
+import type { DiscoveredAccountSettings } from "./discovery/types";
 import {
   RESOURCE_SCOPES,
   type OAuthEnv,
@@ -52,6 +54,7 @@ interface StoredAuthState {
 
 export interface CredentialAuthDependencies {
   verifyAccountSubmission?: typeof verifyAccountSubmission;
+  discoverAccountSettings?: typeof discoverAccountSettings;
 }
 
 const authRequestSchema = z.object({
@@ -255,6 +258,7 @@ interface AccountFormValues {
   sameSmtpCredentials: boolean;
   caldavUrl: string;
   carddavUrl: string;
+  davUser: string;
 }
 
 function firstValue(form: URLSearchParams | undefined, names: readonly string[]): string {
@@ -301,6 +305,7 @@ function accountFormValues(
       : config ? config.smtpUser === config.imapUser && config.smtpPassword === config.password : true,
     caldavUrl: firstValue(form, ["caldav_url"]) || existing?.davConfig?.caldavUrl || "",
     carddavUrl: firstValue(form, ["carddav_url"]) || existing?.davConfig?.carddavUrl || "",
+    davUser: firstValue(form, ["dav_user"]) || existing?.davConfig?.username || config?.imapUser || address,
   };
 }
 
@@ -335,6 +340,7 @@ function accountFormModel(
     dav: {
       calendarUrl: values.caldavUrl,
       contactsUrl: values.carddavUrl,
+      user: values.davUser,
     },
   };
 }
@@ -385,10 +391,64 @@ function renderPasswordPage(
       label: "",
       imap: { host: "", port: "993", tlsMode: "implicit", user: "" },
       smtp: { host: "", port: "587", tlsMode: "starttls", user: "", sameCredentials: true },
-      dav: { calendarUrl: "", contactsUrl: "" },
+      dav: { calendarUrl: "", contactsUrl: "", user: "" },
     },
     ...(errorMessage ? { message: { kind: "error" as const, text: errorMessage } } : {}),
   });
+}
+
+function renderNewAccountPasswordPage(
+  state: string,
+  stored: StoredAuthState,
+  address: string,
+  target: "start" | "add" = "start",
+  errorMessage?: string,
+): string {
+  const form = new URLSearchParams({ address, preset: detectAccountPreset(address) });
+  return renderAuthPage({
+    version: 1,
+    kind: "account-form",
+    title: "Connect your account",
+    clientName: stored.clientName,
+    state,
+    target,
+    step: "new-password",
+    account: accountFormModel(form, undefined, { mail: false, calendar: false, contacts: false }),
+    ...(errorMessage ? { message: { kind: "error" as const, text: errorMessage } } : {}),
+  });
+}
+
+function applyDiscoveredSettings(form: URLSearchParams, settings: DiscoveredAccountSettings, password: string): void {
+  const preset = detectAccountPreset(form.get("address") ?? "");
+  form.set("preset", preset);
+  form.set("label", settings.providerName);
+  form.set("service_options_present", "1");
+  form.delete("enable_mail");
+  form.delete("enable_calendar");
+  form.delete("enable_contacts");
+  if (settings.mail) form.set("enable_mail", "1");
+  if (settings.caldavUrl) form.set("enable_calendar", "1");
+  if (settings.carddavUrl) form.set("enable_contacts", "1");
+  if (preset === "icloud") {
+    form.set("app_password", password);
+    return;
+  }
+  form.set("custom_fields_present", "1");
+  form.set("same_smtp_credentials", "1");
+  form.set("imap_password", password);
+  if (settings.mail) {
+    form.set("imap_host", settings.mail.imapHost);
+    form.set("imap_port", String(settings.mail.imapPort));
+    form.set("imap_tls_mode", settings.mail.imapTlsMode);
+    form.set("imap_user", settings.mail.imapUser);
+    form.set("smtp_host", settings.mail.smtpHost);
+    form.set("smtp_port", String(settings.mail.smtpPort));
+    form.set("smtp_tls_mode", settings.mail.smtpTlsMode);
+    form.set("smtp_user", settings.mail.smtpUser);
+  }
+  if (settings.caldavUrl) form.set("caldav_url", settings.caldavUrl);
+  if (settings.carddavUrl) form.set("carddav_url", settings.carddavUrl);
+  form.set("dav_user", settings.davUser);
 }
 
 function renderAccountFormPage(
@@ -525,6 +585,7 @@ function accountSubmissionFromForm(form: URLSearchParams): AccountSubmission {
     sameSmtpCredentials: customFieldsPresent ? form.has("same_smtp_credentials") : undefined,
     caldavUrl: firstValue(form, ["caldav_url"]) || undefined,
     carddavUrl: firstValue(form, ["carddav_url"]) || undefined,
+    davUser: firstValue(form, ["dav_user"]) || undefined,
   };
 }
 
@@ -561,6 +622,7 @@ function accountSubmissionFromStored(account: StoredMailAccount): AccountSubmiss
     sameSmtpCredentials: config.smtpUser === config.imapUser && config.smtpPassword === config.password,
     caldavUrl: account.davConfig?.caldavUrl,
     carddavUrl: account.davConfig?.carddavUrl,
+    davUser: account.davConfig?.username ?? config.imapUser,
   };
 }
 
@@ -589,7 +651,10 @@ function isVerificationError(error: unknown): boolean {
   return error instanceof MailCredentialError || error instanceof AccountVaultError || error instanceof z.ZodError;
 }
 
-function verificationFailureMessage(): string {
+function verificationFailureMessage(error?: unknown): string {
+  if (error instanceof AccountVaultError && error.message.startsWith("We couldn't connect ")) {
+    return `${error.message}. Check those settings or turn off that service.`;
+  }
   return "We couldn't sign in. Check the details and try again.";
 }
 
@@ -730,7 +795,7 @@ async function completeAuthorization(
       }
       await persistAuthState(env, stateToken, stateWithSelection);
       return htmlResponse(
-        renderAccountFormPage(stateToken, stateWithSelection, "add", undefined, form),
+        renderNewAccountPasswordPage(stateToken, stateWithSelection, address, "add"),
         callbackFormAction,
         200,
         await stateCookieFor(request, stateToken, secret),
@@ -751,7 +816,7 @@ async function completeAuthorization(
     }
     await persistAuthState(env, stateToken, stateWithSelection);
     return htmlResponse(
-      renderStartPage(stateToken, stateWithSelection, undefined, form, "config"),
+      renderNewAccountPasswordPage(stateToken, stateWithSelection, address),
       callbackFormAction,
       200,
       await stateCookieFor(request, stateToken, secret),
@@ -790,6 +855,41 @@ async function completeAuthorization(
         renderPasswordPage(stateToken, nextState, account, "That password didn't work. Try again."),
         callbackFormAction,
         401,
+        await stateCookieFor(request, stateToken, secret),
+      );
+    }
+  }
+
+  if (action === "discover") {
+    const addressResult = z.string().trim().email().max(320).safeParse(form.get("address") ?? "");
+    const passwordResult = z.string().min(1).max(256).safeParse(form.get("new_account_password") ?? "");
+    if (!addressResult.success || !passwordResult.success) {
+      const address = addressResult.success ? addressResult.data.toLowerCase() : "";
+      return htmlResponse(
+        renderNewAccountPasswordPage(stateToken, stateWithSelection, address, target === "add" ? "add" : "start", "Enter your account password."),
+        callbackFormAction,
+        400,
+        await stateCookieFor(request, stateToken, secret),
+      );
+    }
+    const address = addressResult.data.toLowerCase();
+    form.set("address", address);
+    try {
+      const settings = await dependencies.discoverAccountSettings(address);
+      applyDiscoveredSettings(form, settings, passwordResult.data);
+    } catch (error) {
+      if (!(error instanceof AccountDiscoveryError)) {
+        logFailure("account_discovery_failed", { operation: "autoconfigure" }, error);
+      }
+      form.set("preset", detectAccountPreset(address));
+      form.set("label", address.split("@").at(-1) ?? "Email");
+      form.set("service_options_present", "1");
+      return htmlResponse(
+        target === "add"
+          ? renderAccountFormPage(stateToken, stateWithSelection, "add", "We couldn't find all of your settings. Add or correct them below.", form)
+          : renderStartPage(stateToken, stateWithSelection, "We couldn't find all of your settings. Add or correct them below.", form, "config"),
+        callbackFormAction,
+        200,
         await stateCookieFor(request, stateToken, secret),
       );
     }
@@ -932,14 +1032,14 @@ async function completeAuthorization(
       if (!draft) return jsonError("Expired authorization state", 400);
       const existing = target === "edit" ? draft.accounts.find((account) => account.accountId === (form.get("account_id") ?? "")) : undefined;
       return htmlResponse(
-        renderAccountFormPage(stateToken, nextState, target, verificationFailureMessage(), form, existing),
+        renderAccountFormPage(stateToken, nextState, target, verificationFailureMessage(error), form, existing),
         callbackFormAction,
         401,
         await stateCookieFor(request, stateToken, secret),
       );
     }
     return htmlResponse(
-      renderStartPage(stateToken, nextState, verificationFailureMessage(), form, "config"),
+      renderStartPage(stateToken, nextState, verificationFailureMessage(error), form, "config"),
       callbackFormAction,
       401,
       await stateCookieFor(request, stateToken, secret),
@@ -1016,6 +1116,7 @@ function isCredentialConfigurationError(error: unknown): boolean {
 export function createCredentialAuthHandler(dependencies: CredentialAuthDependencies = {}): ExportedHandler<OAuthEnv> {
   const resolved: Required<CredentialAuthDependencies> = {
     verifyAccountSubmission: dependencies.verifyAccountSubmission ?? verifyAccountSubmission,
+    discoverAccountSettings: dependencies.discoverAccountSettings ?? discoverAccountSettings,
   };
   return {
     async fetch(request, env) {

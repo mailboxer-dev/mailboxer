@@ -2,7 +2,7 @@
 
 # mailboxer
 
-mailboxer connects your email, calendars, contacts, and reminders to any agent through an always-on MCP. It is designed for people who want to use their own accounts without deploying and configuring several separate services. iCloud works out of the box, and custom IMAP/SMTP accounts are supported for email.
+mailboxer connects your email, calendars, contacts, and reminders to any agent through an always-on MCP. It is designed for people who want to use their own accounts without deploying and configuring several separate services. iCloud works out of the box, and mailboxer automatically discovers standard IMAP, SMTP, CalDAV, and CardDAV settings for other providers when available.
 
 ## Deploy it yourself
 

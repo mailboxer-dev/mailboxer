@@ -125,6 +125,20 @@ describe("iCloud DAV discovery and live collection access", () => {
     expect(transcript.calls[0]?.headers.get("Authorization")).toBe("Basic ZGF2LXVzZXI6YWNjb3VudC1wYXNzd29yZA==");
   });
 
+  it("accepts same-host resource hrefs for a custom DAV provider", async () => {
+    const transcript = new Transcript([
+      response(`<d:multistatus xmlns:d="DAV:"><d:response><d:href>/principal/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/principal/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`),
+      response(`<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/principal/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/calendars/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`),
+      response(`<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/calendars/personal/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype><d:displayname>Personal</d:displayname></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`),
+    ]);
+    const client = new DavClient(
+      { email: "owner@example.com", password: "account-password" },
+      { caldavUrl: "https://dav.example.com/", username: "dav-user" },
+      transcript.fetch,
+    );
+    await expect(client.listCalendars()).resolves.toMatchObject([{ href: "https://dav.example.com/calendars/personal/" }]);
+  });
+
   it("discovers CardDAV address books and supported vCard versions", async () => {
     const transcript = new Transcript(contactBootstrapResponses());
     const client = new DavClient(credentials, caldavConfig, transcript.fetch);

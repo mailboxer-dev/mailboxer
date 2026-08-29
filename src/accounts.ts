@@ -66,6 +66,7 @@ const storedAccountSchema = z.object({
   davConfig: z.object({
     caldavUrl: z.string().url().optional(),
     carddavUrl: z.string().url().optional(),
+    username: z.string().min(1).max(320).optional(),
   }).optional(),
 });
 const vaultSchema = z.object({
@@ -116,6 +117,7 @@ export interface AccountSubmission {
   sameSmtpCredentials?: boolean;
   caldavUrl?: string;
   carddavUrl?: string;
+  davUser?: string;
 }
 
 export interface VerifyAccountDependencies {
@@ -273,19 +275,13 @@ async function verifyConfig(
   capabilities: StoredMailAccount["capabilities"],
   dependencies: VerifyAccountDependencies,
 ): Promise<void> {
+  const checks: Array<{ service: "imap" | "smtp" | "calendar" | "contacts"; run: () => Promise<void> }> = [];
   if (capabilities.mail) {
-    try {
+    checks.push({ service: "imap", run: async () => {
       const imap = await (dependencies.imapOpen ?? ImapClient.open)(config);
       imap.close();
-    } catch (error) {
-      logFailure("account_verification_failed", {
-        service: "imap",
-        preset: "custom",
-        tls_mode: config.imapTlsMode,
-      }, error);
-      throw new AccountVaultError("The account credentials could not be verified");
-    }
-    try {
+    } });
+    checks.push({ service: "smtp", run: async () => {
       const smtp = await (dependencies.smtpOpen ?? SmtpClient.open)(config);
       try {
         await smtp.authenticate();
@@ -293,26 +289,37 @@ async function verifyConfig(
         await smtp.quit().catch(() => undefined);
         smtp.close();
       }
-    } catch (error) {
-      logFailure("account_verification_failed", {
-        service: "smtp",
-        preset: "custom",
-        tls_mode: config.smtpTlsMode,
-      }, error);
-      throw new AccountVaultError("The account credentials could not be verified");
-    }
+    } });
   }
   const davVerify = dependencies.davVerify ?? ((candidate: MailConfig, candidateDav: DavConfig, service: "calendar" | "contacts") => (
     new DavClient(candidate, candidateDav).verifyService(service)
   ));
   for (const service of ["calendar", "contacts"] as const) {
     if (!capabilities[service]) continue;
+    checks.push({ service, run: () => davVerify(config, davConfig, service) });
+  }
+  const results = await Promise.allSettled(checks.map(async ({ service, run }) => {
     try {
-      await davVerify(config, davConfig, service);
+      await run();
     } catch (error) {
-      logFailure("account_verification_failed", { service, preset: "custom" }, error);
-      throw new AccountVaultError(`The ${service} account could not be verified`);
+      logFailure("account_verification_failed", {
+        service,
+        preset: "custom",
+        ...(service === "imap" ? { tls_mode: config.imapTlsMode } : {}),
+        ...(service === "smtp" ? { tls_mode: config.smtpTlsMode } : {}),
+      }, error);
+      throw error;
     }
+  }));
+  const failed = results.flatMap((result, index) => result.status === "rejected" ? [checks[index]!.service] : []);
+  if (failed.length) {
+    const labels: Record<(typeof failed)[number], string> = {
+      imap: "incoming mail",
+      smtp: "outgoing mail",
+      calendar: "calendar",
+      contacts: "contacts",
+    };
+    throw new AccountVaultError(`We couldn't connect ${failed.map((service) => labels[service]).join(", ")}`);
   }
 }
 
@@ -350,7 +357,7 @@ export async function verifyAccountSubmission(
   } else {
     config = customConfig(submission);
     try {
-      davConfig = customDavConfig(submission.caldavUrl, submission.carddavUrl, capabilities);
+      davConfig = customDavConfig(submission.caldavUrl, submission.carddavUrl, submission.davUser ?? config.imapUser, capabilities);
     } catch (error) {
       throw new AccountVaultError(error instanceof Error ? error.message : "Enter valid calendar and contacts server addresses");
     }

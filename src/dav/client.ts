@@ -298,7 +298,10 @@ function normalizeHref(value: string, base: URL, service: DavService): string {
   } catch {
     throw new DavProtocolError("The DAV response contained an invalid href");
   }
-  if (href.protocol !== "https:" || href.username || href.password || href.hash || (href.port && href.port !== "443") || !serviceHost(service, href.hostname)) {
+  const allowedHost = isICloudDavHost(base.hostname, service)
+    ? serviceHost(service, href.hostname)
+    : href.hostname.toLowerCase() === base.hostname.toLowerCase();
+  if (href.protocol !== "https:" || href.username || href.password || href.hash || (href.port && href.port !== "443") || !allowedHost) {
     throw new DavProtocolError("The DAV response contained an unsafe href");
   }
   return href.toString();

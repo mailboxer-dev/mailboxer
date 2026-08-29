@@ -209,6 +209,7 @@ describe("multi-account vault", () => {
       sameSmtpCredentials: true,
       caldavUrl: "https://dav.example.com/calendar",
       carddavUrl: "https://dav.example.com/contacts",
+      davUser: "dav-user",
     };
 
     const verified = await verifyAccountSubmission(env(), submission, { davVerify });
@@ -216,6 +217,7 @@ describe("multi-account vault", () => {
     expect(verified.davConfig).toEqual({
       caldavUrl: "https://dav.example.com/calendar/",
       carddavUrl: "https://dav.example.com/contacts/",
+      username: "dav-user",
     });
     expect(davVerify).toHaveBeenNthCalledWith(1, verified.config, verified.davConfig, "calendar");
     expect(davVerify).toHaveBeenNthCalledWith(2, verified.config, verified.davConfig, "contacts");
@@ -224,6 +226,35 @@ describe("multi-account vault", () => {
       ...submission,
       caldavUrl: "http://127.0.0.1/calendar",
     }, { davVerify })).rejects.toThrow(/secure public calendar server/u);
+  });
+
+  it("attempts every enabled discovered service before reporting verification failures", async () => {
+    const imapOpen = vi.fn(async () => { throw new Error("imap failed"); });
+    const smtpOpen = vi.fn(async () => { throw new Error("smtp failed"); });
+    const davVerify = vi.fn(async () => { throw new Error("dav failed"); });
+    await expect(verifyAccountSubmission(env(), {
+      preset: "custom",
+      label: "Discovered",
+      address: "me@example.com",
+      enableMail: true,
+      enableCalendar: true,
+      enableContacts: true,
+      imapHost: "imap.example.com",
+      imapPort: 993,
+      imapTlsMode: "implicit",
+      imapUser: "me@example.com",
+      imapPassword: "password",
+      smtpHost: "smtp.example.com",
+      smtpPort: 587,
+      smtpTlsMode: "starttls",
+      sameSmtpCredentials: true,
+      caldavUrl: "https://dav.example.com/",
+      carddavUrl: "https://dav.example.com/",
+      davUser: "me@example.com",
+    }, { imapOpen, smtpOpen, davVerify })).rejects.toThrow(/incoming mail, outgoing mail, calendar, contacts/u);
+    expect(imapOpen).toHaveBeenCalledOnce();
+    expect(smtpOpen).toHaveBeenCalledOnce();
+    expect(davVerify).toHaveBeenCalledTimes(2);
   });
 
   it("loads committed encrypted vaults", async () => {

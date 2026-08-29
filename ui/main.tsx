@@ -65,7 +65,7 @@ const previewModel: AuthPageModel = {
     services: { mail: true, calendar: true, contacts: true },
     imap: { host: "", port: "993", tlsMode: "implicit", user: "" },
     smtp: { host: "", port: "587", tlsMode: "starttls", user: "", sameCredentials: true },
-    dav: { calendarUrl: "", contactsUrl: "" },
+    dav: { calendarUrl: "", contactsUrl: "", user: "" },
   },
 };
 
@@ -232,6 +232,35 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
               <Button type="submit" name="action" value="unlock" size="lg">Continue</Button>
             </div>
           </>
+        ) : page.step === "new-password" ? (
+          <>
+            <Hidden name="address" value={page.account.address} />
+            <FieldGroup className="gap-4">
+              <Field>
+                <FieldLabel htmlFor="new_account_password">
+                  {isCustom ? "Password" : "Apple app-specific password"}
+                </FieldLabel>
+                <Input
+                  id="new_account_password"
+                  name="new_account_password"
+                  type="password"
+                  autoComplete="current-password"
+                  maxLength={256}
+                  autoFocus
+                  required
+                />
+                <FieldDescription>
+                  {isCustom
+                    ? "We'll find your provider settings and connect the available services automatically."
+                    : <ApplePasswordHelp includeWarning />}
+                </FieldDescription>
+              </Field>
+            </FieldGroup>
+            <div className="mt-6 flex flex-col-reverse gap-3 border-t pt-4 sm:flex-row sm:justify-between">
+              <Button type="submit" name="action" value="restart" variant="ghost">Use a different email</Button>
+              <Button type="submit" name="action" value="discover" size="lg">Continue</Button>
+            </div>
+          </>
         ) : (
           <>
             <Hidden name="onboarding_step" value="config" />
@@ -367,6 +396,17 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
                 <FieldSet>
                   <FieldLegend>Calendar and contacts</FieldLegend>
                   <FieldGroup>
+                    <Field>
+                      <FieldLabel htmlFor="dav_user">Calendar and contacts sign-in name</FieldLabel>
+                      <Input
+                        id="dav_user"
+                        name="dav_user"
+                        autoComplete="username"
+                        maxLength={320}
+                        defaultValue={page.account.dav.user || page.account.imap.user || page.account.address}
+                        required
+                      />
+                    </Field>
                     {calendar ? (
                       <Field>
                         <FieldLabel htmlFor="caldav_url">Calendar server address</FieldLabel>
