@@ -4,7 +4,6 @@ import worker from "../src/index";
 
 const env = {
   OAUTH_KV: {} as KVNamespace,
-  MAIL_CREDENTIALS_KV: {} as KVNamespace,
   MAIL_CREDENTIALS_ENCRYPTION_KEY: "a-secure-test-encryption-key-with-32-chars",
 } as unknown as AppEnv;
 

@@ -35,10 +35,9 @@ class MemoryKv {
 
 const encryptionKey = "a-secure-test-encryption-key-with-32-chars";
 
-function env(credentialsKv: MemoryKv, key = encryptionKey): AppEnv {
+function env(kv: MemoryKv, key = encryptionKey): AppEnv {
   return {
-    OAUTH_KV: {} as KVNamespace,
-    MAIL_CREDENTIALS_KV: credentialsKv as unknown as KVNamespace,
+    OAUTH_KV: kv as unknown as KVNamespace,
     OAUTH_PROVIDER: {} as OAuthHelpers,
     MAIL_CREDENTIALS_ENCRYPTION_KEY: key,
   };
@@ -46,8 +45,8 @@ function env(credentialsKv: MemoryKv, key = encryptionKey): AppEnv {
 
 describe("encrypted iCloud credential storage", () => {
   it("stores credentials as encrypted ciphertext and can load them again", async () => {
-    const credentialsKv = new MemoryKv();
-    const environment = env(credentialsKv);
+    const kv = new MemoryKv();
+    const environment = env(kv);
     const credentials: MailCredentials = {
       email: "Owner@iCloud.com",
       imapUser: "Owner",
@@ -55,7 +54,7 @@ describe("encrypted iCloud credential storage", () => {
     };
 
     const credentialId = await storeMailCredentials(environment, credentials);
-    const raw = credentialsKv.raw(`mail:credentials:v1:${credentialId}`) ?? "";
+    const raw = kv.raw(`mail:credentials:v1:${credentialId}`) ?? "";
 
     expect(credentialId).toMatch(/^icloud-[A-Za-z0-9_-]{43}$/u);
     expect(raw).not.toContain("Owner@iCloud.com");
@@ -75,26 +74,26 @@ describe("encrypted iCloud credential storage", () => {
   });
 
   it("rejects records with a different key or modified ciphertext", async () => {
-    const credentialsKv = new MemoryKv();
-    const environment = env(credentialsKv);
+    const kv = new MemoryKv();
+    const environment = env(kv);
     const credentialId = await storeMailCredentials(environment, {
       email: "owner@icloud.com",
       imapUser: "owner",
       appPassword: "abcd-efgh-ijkl-mnop",
     });
 
-    await expect(loadMailCredentials(env(credentialsKv, "another-secure-test-key-with-32-chars"), credentialId))
+    await expect(loadMailCredentials(env(kv, "another-secure-test-key-with-32-chars"), credentialId))
       .rejects.toBeInstanceOf(MailCredentialError);
 
-    const raw = JSON.parse(credentialsKv.raw(`mail:credentials:v1:${credentialId}`) ?? "{}") as { ciphertext: string };
+    const raw = JSON.parse(kv.raw(`mail:credentials:v1:${credentialId}`) ?? "{}") as { ciphertext: string };
     raw.ciphertext = `${raw.ciphertext.slice(0, -1)}${raw.ciphertext.endsWith("A") ? "B" : "A"}`;
-    await credentialsKv.put(`mail:credentials:v1:${credentialId}`, JSON.stringify(raw));
+    await kv.put(`mail:credentials:v1:${credentialId}`, JSON.stringify(raw));
     await expect(loadMailCredentials(environment, credentialId)).rejects.toBeInstanceOf(MailCredentialError);
   });
 
   it("verifies IMAP and SMTP before returning storable credentials", async () => {
-    const credentialsKv = new MemoryKv();
-    const environment = env(credentialsKv);
+    const kv = new MemoryKv();
+    const environment = env(kv);
     const imapClose = vi.fn();
     const smtpAuthenticate = vi.fn(async () => undefined);
     const smtpQuit = vi.fn(async () => undefined);

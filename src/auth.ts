@@ -538,7 +538,7 @@ async function readForm(request: Request): Promise<URLSearchParams> {
 
 function assertCredentialConfiguration(env: OAuthEnv): void {
   getCredentialsEncryptionSecret(env);
-  if (!env.MAIL_CREDENTIALS_KV) throw new Error("MAIL_CREDENTIALS_KV binding is not configured");
+  if (!env.OAUTH_KV) throw new Error("OAUTH_KV binding is not configured");
 }
 
 async function persistAuthState(env: OAuthEnv, state: string, stored: StoredAuthState): Promise<void> {
@@ -1109,7 +1109,7 @@ function isCredentialConfigurationError(error: unknown): boolean {
   return error instanceof Error && (
     error.message.startsWith("Missing Worker secret or variable: MAIL_CREDENTIALS_ENCRYPTION_KEY") ||
     error.message.startsWith("MAIL_CREDENTIALS_ENCRYPTION_KEY must") ||
-    error.message === "MAIL_CREDENTIALS_KV binding is not configured"
+    error.message === "OAUTH_KV binding is not configured"
   );
 }
 
