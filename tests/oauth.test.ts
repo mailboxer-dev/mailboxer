@@ -2,7 +2,7 @@ import type { AuthRequest, CompleteAuthorizationOptions, OAuthHelpers } from "@c
 import { describe, expect, it, vi } from "vitest";
 import { AccountVaultError, commitAccountDraft, newAccountDraft, type AccountSubmission } from "../src/accounts";
 import { createCredentialAuthHandler, type CredentialAuthDependencies } from "../src/auth";
-import { decodeAuthPageModel, type AuthPageModel } from "../src/auth-ui";
+import { decodeAuthPageModel, decodeUiPageModel, type AuthPageModel } from "../src/auth-ui";
 import { MailCredentialError } from "../src/credentials";
 import type { DiscoveredAccountSettings } from "../src/discovery/types";
 import { restrictMailPropsToTokenScope, type AppEnv, type StoredMailAccount } from "../src/types";
@@ -181,6 +181,85 @@ function discoveredSettings(address = "person@example.com"): DiscoveredAccountSe
 }
 
 const context = {} as ExecutionContext;
+
+describe("public onboarding routes", () => {
+  it("renders a landing page with origin-specific setup URLs", async () => {
+    const response = await authFetchFor()(new Request("https://self-host.example:8443/"), oauthEnv(), context);
+    const body = await response.text();
+    const encoded = /data-page="([A-Za-z0-9_-]+)"/u.exec(body)?.[1] ?? "";
+    const model = decodeUiPageModel(encoded);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(response.headers.get("Content-Security-Policy")).toContain("script-src 'self'");
+    expect(model).toEqual({
+      version: 1,
+      kind: "landing",
+      origin: "https://self-host.example:8443",
+      mcpUrl: "https://self-host.example:8443/mcp",
+      agentSetupUrl: "https://self-host.example:8443/agent-setup/prompt.md",
+    });
+
+    const head = await authFetchFor()(new Request("https://self-host.example:8443/", { method: "HEAD" }), oauthEnv(), context);
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+    expect(head.headers.get("Content-Type")).toBe(response.headers.get("Content-Type"));
+    expect(head.headers.get("Content-Security-Policy")).toBe(response.headers.get("Content-Security-Policy"));
+  });
+
+  it("serves dynamic onboarding instructions and a bodyless HEAD response", async () => {
+    const authFetch = authFetchFor();
+    const get = await authFetch(new Request("https://hosted.example/agent-setup/prompt.md"), oauthEnv(), context);
+    const prompt = await get.text();
+    expect(get.status).toBe(200);
+    expect(get.headers.get("Content-Type")).toBe("text/markdown; charset=utf-8");
+    expect(get.headers.get("Cache-Control")).toBe("no-store");
+    expect(get.headers.get("Content-Security-Policy")).toContain("default-src 'none'");
+    expect(prompt).toContain("https://hosted.example/mcp");
+    expect(prompt).toContain("codex mcp add mailboxer --url https://hosted.example/mcp");
+    expect(prompt).toContain("codex mcp login mailboxer");
+    expect(prompt).toContain("claude mcp add --transport http --scope user mailboxer https://hosted.example/mcp");
+    expect(prompt).toContain("Do not ask the user for a mailbox password");
+    expect(prompt).toContain("https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta");
+    expect(prompt).toContain("https://support.anthropic.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp");
+
+    const head = await authFetch(new Request("https://hosted.example/agent-setup/prompt.md", { method: "HEAD" }), oauthEnv(), context);
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+    expect(head.headers.get("Content-Type")).toBe(get.headers.get("Content-Type"));
+    expect(head.headers.get("Cache-Control")).toBe(get.headers.get("Cache-Control"));
+    expect(head.headers.get("Content-Security-Policy")).toBe(get.headers.get("Content-Security-Policy"));
+  });
+
+  it("moves the legacy health JSON response to /health", async () => {
+    const authFetch = authFetchFor();
+    const get = await authFetch(new Request("https://hosted.example/health"), oauthEnv(), context);
+    expect(get.status).toBe(200);
+    expect(get.headers.get("Content-Type")).toBe("application/json");
+    expect(await get.json()).toEqual({ name: "email-mcp", endpoint: "/mcp", status: "ok" });
+
+    const head = await authFetch(new Request("https://hosted.example/health", { method: "HEAD" }), oauthEnv(), context);
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+  });
+
+  it("returns method errors for public routes without changing the unknown-route contract", async () => {
+    const authFetch = authFetchFor();
+    for (const path of ["/", "/agent-setup/prompt.md", "/health"]) {
+      const response = await authFetch(new Request(`https://hosted.example${path}`, { method: "POST" }), oauthEnv(), context);
+      expect(response.status).toBe(405);
+      expect(response.headers.get("Allow")).toBe("GET, HEAD");
+      expect(await response.text()).toBe("Method not allowed");
+    }
+
+    const missing = await authFetch(new Request("https://hosted.example/missing"), oauthEnv(), context);
+    expect(missing.status).toBe(404);
+    expect(await missing.text()).toBe("Not found");
+  });
+});
 
 describe("multi-account OAuth authorization", () => {
   it("narrows v2 and legacy props to the access token scope", () => {

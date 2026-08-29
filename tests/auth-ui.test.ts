@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { detectAccountPreset } from "../src/auth-ui";
+import {
+  decodeAuthPageModel,
+  decodeUiPageModel,
+  detectAccountPreset,
+  renderUiPage,
+  type AuthPageModel,
+  type LandingPageModel,
+} from "../src/auth-ui";
 
 describe("account provider detection", () => {
   it.each([
@@ -17,5 +24,43 @@ describe("account provider detection", () => {
     "person@icloud.com.example.org",
   ])("detects %s as a custom server account", (address) => {
     expect(detectAccountPreset(address)).toBe("custom");
+  });
+});
+
+describe("shared UI page models", () => {
+  it("round-trips a landing page model through the HTML shell", () => {
+    const page: LandingPageModel = {
+      version: 1,
+      kind: "landing",
+      origin: "https://mailboxer.example",
+      mcpUrl: "https://mailboxer.example/mcp",
+      agentSetupUrl: "https://mailboxer.example/agent-setup/prompt.md",
+    };
+    const html = renderUiPage(page);
+    const encoded = /data-page="([A-Za-z0-9_-]+)"/u.exec(html)?.[1];
+
+    expect(encoded).toBeTruthy();
+    expect(decodeUiPageModel(encoded ?? "")).toEqual(page);
+    expect(html).toContain("<title>Mailboxer — connect your agent</title>");
+    expect(html).toContain("<meta name=\"description\" content=\"Give your agent a mailbox.");
+    expect(html).toContain("This onboarding page requires JavaScript.");
+    expect(html).toContain("/auth.js");
+    expect(html).toContain("/style.css");
+  });
+
+  it("keeps authorization decoding separate from landing decoding", () => {
+    const page: AuthPageModel = {
+      version: 1,
+      kind: "management",
+      clientName: "Test client",
+      title: "Manage accounts",
+      state: "state",
+      accounts: [],
+    };
+    const html = renderUiPage(page);
+    const encoded = /data-page="([A-Za-z0-9_-]+)"/u.exec(html)?.[1] ?? "";
+
+    expect(decodeAuthPageModel(encoded)).toEqual(page);
+    expect(decodeUiPageModel(encoded)).toEqual(page);
   });
 });

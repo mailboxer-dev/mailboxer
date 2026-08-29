@@ -22,10 +22,12 @@ import {
 } from "./accounts";
 import {
   detectAccountPreset,
+  renderUiPage,
   renderAuthPage,
   type AccountFormModel,
   type AccountFormStep,
   type AccountFormTarget,
+  type LandingPageModel,
 } from "./auth-ui";
 import { getCredentialsEncryptionSecret } from "./config";
 import { MailCredentialError } from "./credentials";
@@ -225,6 +227,120 @@ function buildHtmlResponse(request: Request, body: string, formAction: string, s
   }
   if (cookie) headers.set("Set-Cookie", cookie);
   return new Response(body, { status, headers });
+}
+
+function landingPageModel(request: Request): LandingPageModel {
+  const origin = new URL(request.url).origin;
+  return {
+    version: 1,
+    kind: "landing",
+    origin,
+    mcpUrl: new URL("/mcp", origin).toString(),
+    agentSetupUrl: new URL("/agent-setup/prompt.md", origin).toString(),
+  };
+}
+
+function publicHeaders(request: Request, contentType: string): Headers {
+  const headers = new Headers({
+    "Cache-Control": "no-store",
+    "Content-Type": contentType,
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+  });
+  if (!isLocalDevelopmentRequest(request)) {
+    headers.set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+  }
+  return headers;
+}
+
+function landingHtmlResponse(request: Request, body: string): Response {
+  const headers = publicHeaders(request, "text/html; charset=utf-8");
+  if (!isLocalDevelopmentRequest(request)) {
+    headers.set(
+      "Content-Security-Policy",
+      "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+    );
+  }
+  return new Response(request.method === "HEAD" ? null : body, { status: 200, headers });
+}
+
+function publicTextResponse(request: Request, body: string, contentType: string): Response {
+  return new Response(request.method === "HEAD" ? null : body, {
+    status: 200,
+    headers: publicHeaders(request, contentType),
+  });
+}
+
+function publicJsonResponse(request: Request, value: unknown): Response {
+  return publicTextResponse(request, JSON.stringify(value), "application/json");
+}
+
+function methodNotAllowed(allow: string): Response {
+  return new Response("Method not allowed", {
+    status: 405,
+    headers: {
+      Allow: allow,
+      "Cache-Control": "no-store",
+      "Content-Type": "text/plain; charset=utf-8",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+function agentSetupPrompt(page: LandingPageModel): string {
+  return `# Connect this agent to Mailboxer
+
+You are helping the user connect their current AI agent to Mailboxer, which gives the agent access to the user's email, calendars, and contacts after the user signs in. Identify the agent you are running in and follow only the matching section below.
+
+Mailboxer MCP address: \`${page.mcpUrl}\`
+
+Do not ask the user for a mailbox password, request that they paste one into this chat, or handle one yourself. Mailboxer collects and protects sign-in details in its existing browser authorization flow.
+
+## Codex CLI
+
+Run these commands in the user's terminal:
+
+\`\`\`sh
+codex mcp add mailboxer --url ${page.mcpUrl}
+codex mcp login mailboxer
+\`\`\`
+
+If the login command opens a browser, have the user finish signing in there. Keep the mailbox password in that browser flow.
+
+## Claude Code
+
+Run this command in the user's terminal:
+
+\`\`\`sh
+claude mcp add --transport http --scope user mailboxer ${page.mcpUrl}
+\`\`\`
+
+Then have the user complete the browser sign-in when Claude Code requests authentication. The \`--scope user\` option keeps the connection available to the user's Claude Code sessions instead of writing a repository-local configuration.
+
+## ChatGPT or Claude on the web
+
+You cannot change the host app's connector settings from inside the conversation. Give the user these short manual steps instead:
+
+1. In ChatGPT, open Settings → Apps, create a custom app, paste \`${page.mcpUrl}\`, and follow the sign-in prompt.
+2. In Claude, open Settings → Connectors, add a custom connector, paste \`${page.mcpUrl}\`, and choose Connect.
+3. Name the connection \`mailboxer\` and complete Mailboxer's browser sign-in when prompted.
+
+For ChatGPT, use the [custom app and full MCP connector guide](https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta). For Claude, use [Anthropic's custom connector guide](https://support.anthropic.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp).
+
+## Other compatible agents
+
+Add a user-level remote MCP server named \`mailboxer\` with this address:
+
+\`\`\`text
+${page.mcpUrl}
+\`\`\`
+
+Prefer a user-level connection so the agent can use Mailboxer across projects. Do not create a repository-local configuration unless the user specifically asks for one.
+
+## Verify the connection
+
+After registration, confirm that a server named \`mailboxer\` is present and initialize it or list its available tools. If the agent reports that authorization is required, follow the browser sign-in page and then retry the connection. Tell the user whether registration succeeded and whether browser sign-in is still required.
+`;
 }
 
 function asStoredState(value: unknown): StoredAuthState | null {
@@ -1125,10 +1241,29 @@ export function createCredentialAuthHandler(dependencies: CredentialAuthDependen
         if (url.pathname === "/authorize") {
           if (request.method === "GET") return await beginCredentialAuthorization(request, env);
           if (request.method === "POST") return await completeAuthorization(request, env, resolved);
-          return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
+          return methodNotAllowed("GET, POST");
         }
-        if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) {
-          return Response.json({ name: "email-mcp", endpoint: "/mcp", status: "ok" });
+        if (url.pathname === "/") {
+          if (request.method === "GET" || request.method === "HEAD") {
+            return landingHtmlResponse(request, renderUiPage(landingPageModel(request)));
+          }
+          return methodNotAllowed("GET, HEAD");
+        }
+        if (url.pathname === "/agent-setup/prompt.md") {
+          if (request.method === "GET" || request.method === "HEAD") {
+            return publicTextResponse(
+              request,
+              agentSetupPrompt(landingPageModel(request)),
+              "text/markdown; charset=utf-8",
+            );
+          }
+          return methodNotAllowed("GET, HEAD");
+        }
+        if (url.pathname === "/health") {
+          if (request.method === "GET" || request.method === "HEAD") {
+            return publicJsonResponse(request, { name: "email-mcp", endpoint: "/mcp", status: "ok" });
+          }
+          return methodNotAllowed("GET, HEAD");
         }
         return new Response("Not found", { status: 404 });
       } catch (error) {
