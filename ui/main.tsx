@@ -539,7 +539,7 @@ function ManagementPage({ page }: { page: Extract<AuthPageModel, { kind: "manage
     <PageFrame page={page}>
       <div className="flex flex-col gap-4">
         {page.accounts.map((account) => (
-          <Card key={account.accountId} className="gap-4 shadow-none">
+          <Card key={account.accountId} className="gap-0 shadow-none">
             <CardHeader>
               <div className="flex min-w-0 items-start gap-3">
                 <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border bg-muted">
@@ -552,13 +552,13 @@ function ManagementPage({ page }: { page: Extract<AuthPageModel, { kind: "manage
               </div>
               {account.isDefault ? <CardAction><Badge>Used by default</Badge></CardAction> : null}
             </CardHeader>
-            <CardContent>
+            <CardContent className="py-4">
               <div className="flex flex-wrap gap-2">
                 <Badge variant="outline">{account.preset === "icloud" ? "iCloud" : "Other provider"}</Badge>
                 {capabilityLabels(account).map((capability) => <Badge key={capability} variant="secondary">{capability}</Badge>)}
               </div>
             </CardContent>
-            <CardFooter className="flex flex-wrap gap-2 border-t pt-4">
+            <CardFooter className="flex flex-wrap gap-2">
               <form method="post" action="/authorize" className="contents">
                 <Hidden name="authorization_state" value={page.state} />
                 <Hidden name="mode" value="manage" />
