@@ -5,6 +5,7 @@ import { getCredentialsEncryptionSecret } from "./config";
 import { davConfigForAccount } from "./providers";
 import {
   MAX_DAV_PAGE_SIZE,
+  MAX_DAV_REQUEST_BYTES,
   MAX_DAV_RESOURCE_BYTES,
   DavClient,
 } from "./dav/client";
@@ -36,6 +37,8 @@ function hasHeaderControl(value: string): boolean {
 }
 
 const hrefSchema = z.string().min(1).max(HREF_MAX).refine((value) => !hasHeaderControl(value), "Invalid href");
+const calendarCollectionHrefSchema = hrefSchema.describe("Canonical calendar collection href returned by list_calendars.");
+const calendarItemHrefSchema = hrefSchema.describe("Canonical calendar item href returned by list_calendar_items or get_calendar_item.");
 const etagSchema = z.string().min(1).max(ETAG_MAX).refine((value) => value.trim() !== "*" && !hasHeaderControl(value), "Invalid ETag");
 const isoDateSchema = z.string().max(64).refine(isIsoDateOrDateTime, "Invalid ISO date or date-time");
 const calendarTextSchema = z.string().max(TEXT_MAX).refine((value) => !hasInvalidControl(value), "Invalid calendar text");
@@ -57,7 +60,12 @@ const calendarInputSchema = z.object({
   rrule: calendarTextSchema.max(4_096).optional(),
   categories: z.array(calendarTextSchema.max(256)).max(100).optional(),
   url: z.string().max(2_048).refine((value) => !hasHeaderControl(value), "Invalid URL").optional(),
-  rawIcalendar: z.string().max(MAX_DAV_RESOURCE_BYTES).refine((value) => !hasInvalidControl(value), "Invalid iCalendar").optional(),
+  rawIcalendar: z.string()
+    .max(MAX_DAV_REQUEST_BYTES)
+    .refine((value) => new TextEncoder().encode(value).byteLength <= MAX_DAV_REQUEST_BYTES, `iCalendar must be at most ${MAX_DAV_REQUEST_BYTES} UTF-8 bytes`)
+    .refine((value) => !hasInvalidControl(value), "Invalid iCalendar")
+    .describe(`Authoritative RFC 5545 body. Arbitrary properties such as ATTACH are preserved; inline BASE64 data counts toward the ${MAX_DAV_REQUEST_BYTES}-byte request limit.`)
+    .optional(),
 });
 
 const contactTextSchema = z.string().max(TEXT_MAX).refine((value) => !hasInvalidControl(value), "Invalid contact text");
@@ -102,7 +110,10 @@ const contactInputSchema = z.object({
 const listLimitSchema = z.number().int().min(1).max(MAX_DAV_PAGE_SIZE).optional().default(MAX_DAV_PAGE_SIZE);
 const utcIsoDateSchema = z.string().max(64).refine(isUtcIsoDateOrDateTime, "Invalid UTC ISO date or date-time");
 const deleteConfirmationSchema = z.literal("delete");
-const accountIdSchema = z.string().regex(/^acct_[A-Za-z0-9_-]{22}$|^icloud-[A-Za-z0-9_-]{43}$/u).optional();
+const accountIdSchema = z.string()
+  .regex(/^acct_[A-Za-z0-9_-]{22}$|^icloud-[A-Za-z0-9_-]{43}$/u)
+  .describe("Configured account identifier returned by list_accounts; preserve it from the source workflow when that account supports calendar.")
+  .optional();
 
 async function selectUserDav(
   env: AppEnv,
@@ -139,7 +150,7 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
   server.registerTool(
     "list_calendars",
     {
-      description: "List live iCloud CalDAV calendars for one configured account and their supported component types.",
+      description: "List live CalDAV calendars for one configured account. Preserve the source accountId when it supports calendar; otherwise call list_accounts and select an account with capabilities.calendar=true. Use the returned calendars[].href exactly as calendarHref for calendar item reads and writes; choose a calendar by displayName and supported componentTypes.",
       inputSchema: { accountId: accountIdSchema },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
@@ -151,16 +162,16 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }),
+    }, { accountId }),
   );
 
   server.registerTool(
     "list_calendar_items",
     {
-      description: "List live iCloud CalDAV VEVENT and VTODO resources with bounded structured fields and signed stateless cursors.",
+      description: "List live iCloud CalDAV VEVENT and VTODO resources with bounded structured fields and signed stateless cursors. If calendarHref is supplied, use a canonical href returned by list_calendars.",
       inputSchema: {
         accountId: accountIdSchema,
-        calendarHref: hrefSchema.optional(),
+        calendarHref: calendarCollectionHrefSchema.optional(),
         componentType: z.enum(["VEVENT", "VTODO", "any"]).optional().default("any"),
         text: z.string().max(QUERY_MAX).refine((value) => !hasHeaderControl(value), "Invalid text").optional(),
         start: utcIsoDateSchema.optional(),
@@ -193,14 +204,14 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }),
+    }, { accountId, calendarHref }),
   );
 
   server.registerTool(
     "get_calendar_item",
     {
-      description: "Fetch one live iCloud CalDAV VEVENT or VTODO resource by canonical href.",
-      inputSchema: { accountId: accountIdSchema, href: hrefSchema },
+      description: "Fetch one live iCloud CalDAV VEVENT or VTODO resource by canonical item href returned by list_calendar_items.",
+      inputSchema: { accountId: accountIdSchema, href: calendarItemHrefSchema },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ accountId, href }) => withToolSpan("get_calendar_item", async () => {
@@ -211,16 +222,16 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }),
+    }, { accountId, calendarHref: href }),
   );
 
   server.registerTool(
     "create_calendar_item",
     {
-      description: "Create a VEVENT or VTODO in a live iCloud CalDAV calendar; an optional raw iCalendar body is authoritative.",
+      description: `Create a VEVENT or VTODO in a live iCloud CalDAV calendar. First call list_calendars and pass its exact calendars[].href as calendarHref. rawIcalendar is authoritative and carries RFC 5545 properties such as ATTACH; inline BASE64 ticket data counts toward the ${MAX_DAV_REQUEST_BYTES}-byte request limit. The stored resource is read back, and requestedAttachmentPreserved explicitly reports whether the server retained a requested ATTACH property.`,
       inputSchema: {
         accountId: accountIdSchema,
-        calendarHref: hrefSchema,
+        calendarHref: calendarCollectionHrefSchema,
         ...calendarInputSchema.shape,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -233,16 +244,16 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }),
+    }, { accountId, calendarHref }),
   );
 
   server.registerTool(
     "update_calendar_item",
     {
-      description: "Update a live iCloud CalDAV resource with a required current ETag; stale writes are rejected.",
+      description: `Update a live iCloud CalDAV resource with its current ETag; stale writes are rejected. Use the href and ETag returned by get_calendar_item or list_calendar_items. rawIcalendar is authoritative and carries RFC 5545 properties such as ATTACH; inline BASE64 ticket data counts toward the ${MAX_DAV_REQUEST_BYTES}-byte request limit. The stored resource is read back, and requestedAttachmentPreserved explicitly reports whether the server retained a requested ATTACH property.`,
       inputSchema: {
         accountId: accountIdSchema,
-        href: hrefSchema,
+        href: calendarItemHrefSchema,
         etag: etagSchema,
         ...calendarInputSchema.shape,
       },
@@ -257,7 +268,7 @@ export function registerDavTools(server: McpServer, env: AppEnv, props: AuthProp
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }),
+    }, { accountId, calendarHref: href }),
   );
 
   server.registerTool(

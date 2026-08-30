@@ -41,6 +41,7 @@ export interface CalendarItem extends CalendarItemFields {
   href: string;
   etag: string | null;
   rawIcalendar: string;
+  requestedAttachmentPreserved?: boolean;
 }
 
 export interface CalendarItemInput {

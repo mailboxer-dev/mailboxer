@@ -6,7 +6,7 @@ import { IcalendarParseError } from "./dav/ical";
 import { VcardParseError } from "./dav/vcard";
 import { ImapProtocolError, MessageTooLargeError } from "./imap/client";
 import { SmtpProtocolError } from "./smtp/client";
-import { withSpan } from "./tracing";
+import { withSpan, type TraceAttributes } from "./tracing";
 import type { AuthProps, ResourceScope } from "./types";
 import { z } from "zod";
 
@@ -35,6 +35,43 @@ export function requireScope(props: AuthProps, scope: ResourceScope): void {
   }
 }
 
-export function withToolSpan<T>(name: string, operation: () => Promise<T>): Promise<T> {
-  return withSpan(`mcp.tool.${name}`, { "mcp.tool.name": name }, operation);
+export interface ToolCorrelation {
+  accountId?: string;
+  mailbox?: string;
+  uid?: number;
+  part?: string;
+  calendarHref?: string;
+}
+
+async function correlationKey(field: string, value: string | undefined): Promise<string | undefined> {
+  if (!value) return undefined;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${field}\u0000${value}`));
+  return Array.from(new Uint8Array(digest).slice(0, 12), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function correlationAttributes(values: ToolCorrelation): Promise<TraceAttributes> {
+  const [accountKey, mailboxKey, calendarHrefKey] = await Promise.all([
+    correlationKey("account", values.accountId),
+    correlationKey("mailbox", values.mailbox),
+    correlationKey("calendar-href", values.calendarHref),
+  ]);
+  return {
+    "mcp.tool.invocation_id": crypto.randomUUID(),
+    "mcp.tool.account_key": accountKey,
+    "mcp.tool.mailbox_key": mailboxKey,
+    "mcp.tool.uid": values.uid,
+    "mcp.tool.part": values.part,
+    "mcp.tool.calendar_href_key": calendarHrefKey,
+  };
+}
+
+export async function withToolSpan<T>(
+  name: string,
+  operation: () => Promise<T>,
+  correlation: ToolCorrelation = {},
+): Promise<T> {
+  return withSpan(`mcp.tool.${name}`, {
+    "mcp.tool.name": name,
+    ...await correlationAttributes(correlation),
+  }, operation);
 }
