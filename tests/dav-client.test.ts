@@ -6,6 +6,7 @@ import {
   DavNotFoundError,
   DavPayloadTooLargeError,
   DavPermissionError,
+  MAX_DAV_REQUEST_BYTES,
   type DavFetcher,
 } from "../src/dav/client";
 
@@ -232,7 +233,11 @@ describe("iCloud DAV reports and conditional writes", () => {
   });
 
   it("requires If-Match for updates/deletes and uses If-None-Match for creates", async () => {
-    const createTranscript = new Transcript([response("", 204, { ETag: '"created"' })]);
+    const createdRaw = eventRaw.replace("event-a", "created-event").replace("Event A", "Created");
+    const createTranscript = new Transcript([
+      response("", 204, { ETag: '"created"' }),
+      response(createdRaw, 200, { ETag: '"created"' }),
+    ]);
     const client = new DavClient(credentials, caldavConfig, createTranscript.fetch);
     const created = await client.createCalendarItem("https://caldav.icloud.com/calendars/a/", {
       componentType: "VEVENT",
@@ -243,8 +248,12 @@ describe("iCloud DAV reports and conditional writes", () => {
     expect(created.etag).toBe('"created"');
     expect(createTranscript.calls[0]?.method).toBe("PUT");
     expect(createTranscript.calls[0]?.headers.get("If-None-Match")).toBe("*");
+    expect(createTranscript.calls[1]?.method).toBe("GET");
 
-    const updateTranscript = new Transcript([response("", 204, { ETag: '"new"' })]);
+    const updateTranscript = new Transcript([
+      response("", 204, { ETag: '"new"' }),
+      response(eventRaw, 200, { ETag: '"new"' }),
+    ]);
     const updater = new DavClient(credentials, caldavConfig, updateTranscript.fetch);
     const updated = await updater.updateCalendarItem("https://caldav.icloud.com/calendars/a/event.ics", '"old"', {
       componentType: "VEVENT",
@@ -252,12 +261,71 @@ describe("iCloud DAV reports and conditional writes", () => {
     });
     expect(updated.etag).toBe('"new"');
     expect(updateTranscript.calls[0]?.headers.get("If-Match")).toBe('"old"');
+    expect(updateTranscript.calls[1]?.method).toBe("GET");
 
     const deleteTranscript = new Transcript([response("", 204)]);
     const deleter = new DavClient(credentials, caldavConfig, deleteTranscript.fetch);
     await expect(deleter.deleteContact("https://contacts.icloud.com/addressbooks/a/contact.vcf", '"etag"')).resolves.toBeUndefined();
     expect(deleteTranscript.calls[0]?.method).toBe("DELETE");
     expect(deleteTranscript.calls[0]?.headers.get("If-Match")).toBe('"etag"');
+  });
+
+  it("passes an inline ticket ATTACH through PUT unchanged", async () => {
+    const rawWithTicket = `${eventRaw.replace("END:VEVENT", "ATTACH;FMTTYPE=application/pdf;ENCODING=BASE64;VALUE=BINARY:JVBERi0xLjQK\r\nEND:VEVENT")}`;
+    const transcript = new Transcript([
+      response("", 204, { ETag: '"put"' }),
+      response(rawWithTicket, 200, { ETag: '"persisted"' }),
+    ]);
+    const client = new DavClient(credentials, caldavConfig, transcript.fetch);
+
+    const item = await client.createCalendarItem("https://caldav.icloud.com/calendars/a/", {
+      componentType: "VEVENT",
+      rawIcalendar: rawWithTicket,
+    });
+
+    expect(transcript.calls[0]?.method).toBe("PUT");
+    expect(transcript.calls[0]?.body).toBe(rawWithTicket);
+    expect(transcript.calls[1]?.method).toBe("GET");
+    expect(item.rawIcalendar).toBe(rawWithTicket);
+    expect(item.etag).toBe('"persisted"');
+    expect(item.requestedAttachmentPreserved).toBe(true);
+  });
+
+  it("reports when the server removes a requested ATTACH property", async () => {
+    const rawWithTicket = eventRaw.replace("END:VEVENT", "ATTACH:https://example.test/ticket.pdf\r\nEND:VEVENT");
+    const transcript = new Transcript([
+      response("", 204, { ETag: '"put"' }),
+      response(eventRaw, 200, { ETag: '"persisted"' }),
+    ]);
+    const client = new DavClient(credentials, caldavConfig, transcript.fetch);
+
+    const item = await client.createCalendarItem("https://caldav.icloud.com/calendars/a/", {
+      componentType: "VEVENT",
+      rawIcalendar: rawWithTicket,
+    });
+
+    expect(item.rawIcalendar).toBe(eventRaw);
+    expect(item.requestedAttachmentPreserved).toBe(false);
+  });
+
+  it("returns the server representation after an update instead of the submitted body", async () => {
+    const submitted = eventRaw.replace("SUMMARY:Event A", "SUMMARY:Submitted");
+    const persisted = eventRaw.replace("SUMMARY:Event A", "SUMMARY:Server normalized");
+    const transcript = new Transcript([
+      response("", 204, { ETag: '"new"' }),
+      response(persisted, 200, { ETag: '"server"' }),
+    ]);
+    const client = new DavClient(credentials, caldavConfig, transcript.fetch);
+
+    const item = await client.updateCalendarItem("https://caldav.icloud.com/calendars/a/event.ics", '"old"', {
+      componentType: "VEVENT",
+      rawIcalendar: submitted,
+    });
+
+    expect(transcript.calls[0]?.body).toBe(submitted);
+    expect(item.rawIcalendar).toBe(persisted);
+    expect(item.summary).toBe("Server normalized");
+    expect(item.etag).toBe('"server"');
   });
 });
 
@@ -282,6 +350,22 @@ describe("DAV status and response bounds", () => {
     const tooLarge = new Transcript([response("small", 200, { "Content-Length": String(512 * 1024 + 1) })]);
     await expect(new DavClient(credentials, caldavConfig, tooLarge.fetch).getContact("https://contacts.icloud.com/contact.vcf"))
       .rejects.toBeInstanceOf(DavPayloadTooLargeError);
+  });
+
+  it("rejects a calendar PUT that exceeds the actual DAV request-body limit", async () => {
+    const prefix = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:oversized\r\nDESCRIPTION:";
+    const suffix = "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const fixedBytes = new TextEncoder().encode(`${prefix}${suffix}`).byteLength;
+    const raw = `${prefix}${"x".repeat(MAX_DAV_REQUEST_BYTES + 1 - fixedBytes)}${suffix}`;
+    expect(new TextEncoder().encode(raw).byteLength).toBe(MAX_DAV_REQUEST_BYTES + 1);
+    const transcript = new Transcript([]);
+    const client = new DavClient(credentials, caldavConfig, transcript.fetch);
+
+    await expect(client.createCalendarItem("https://caldav.icloud.com/calendars/a/", {
+      componentType: "VEVENT",
+      rawIcalendar: raw,
+    })).rejects.toBeInstanceOf(DavPayloadTooLargeError);
+    expect(transcript.calls).toHaveLength(0);
   });
 
   it("does not forward credentials after an unsafe principal href", async () => {

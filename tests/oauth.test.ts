@@ -632,7 +632,7 @@ describe("multi-account OAuth authorization", () => {
     },
   ])("preserves custom account credentials when $name", async ({ passwordFields, expectedIncoming, expectedOutgoing }) => {
     const credentialsKv = new MemoryKv();
-    const environment = oauthEnv({ credentialsKv });
+    const environment = oauthEnv({ kv: credentialsKv });
     const savedAccount = customAccount();
     const vault = await commitAccountDraft(environment, newAccountDraft(savedAccount));
     const verify = vi.fn(async (_env, submission: AccountSubmission) => ({

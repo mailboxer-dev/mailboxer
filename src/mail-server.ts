@@ -36,7 +36,10 @@ const searchShape = {
 const mailboxSchema = z.string().min(1).max(MAILBOX_LIMIT);
 const uidSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 const uidListSchema = z.array(uidSchema).min(1).max(MAX_UIDS_PER_MUTATION);
-const accountIdSchema = z.string().regex(/^acct_[A-Za-z0-9_-]{22}$|^icloud-[A-Za-z0-9_-]{43}$/u).optional();
+const accountIdSchema = z.string()
+  .regex(/^acct_[A-Za-z0-9_-]{22}$|^icloud-[A-Za-z0-9_-]{43}$/u)
+  .describe("Configured account identifier returned by list_accounts; preserve it across related workflow calls.")
+  .optional();
 
 function safeUidList(values: number[]): number[] {
   return [...new Set(uidListSchema.parse(values))];
@@ -141,7 +144,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }),
+    }, { accountId, mailbox }),
   );
 
   server.registerTool(
@@ -176,13 +179,13 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }),
+    }, { accountId, mailbox }),
   );
 
   server.registerTool(
     "get_message",
     {
-      description: "Fetch one live IMAP message by UID, parse its RFC822 content, and return bounded structured MIME data.",
+      description: "Fetch one live IMAP message by UID, parse its RFC822 content, and return bounded structured MIME data. The result includes metadata.attachments[] with authoritative IMAP BODYSTRUCTURE part identifiers; pass metadata.attachments[].part unchanged to get_attachment when a separate attachment fetch is needed. Parsed attachments may already include bounded base64 bodies.",
       inputSchema: {
         accountId: accountIdSchema,
         mailbox: mailboxSchema.optional().default("INBOX"),
@@ -202,18 +205,20 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }),
+    }, { accountId, mailbox, uid }),
   );
 
   server.registerTool(
     "get_attachment",
     {
-      description: "Fetch one bounded attachment body from a live IMAP message by UID and BODY part number.",
+      description: "Fetch one bounded attachment body from a live IMAP message by UID and BODY part number. Call this after get_message with the same accountId, mailbox, and uid, using the exact metadata.attachments[].part value returned by get_message; do not guess or renumber the IMAP part.",
       inputSchema: {
         accountId: accountIdSchema,
         mailbox: mailboxSchema.optional().default("INBOX"),
         uid: uidSchema,
-        part: z.string().regex(/^\d+(?:\.\d+)*$/u),
+        part: z.string()
+          .regex(/^\d+(?:\.\d+)*$/u)
+          .describe("Exact IMAP BODYSTRUCTURE part returned in get_message metadata.attachments[].part."),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
@@ -240,7 +245,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }),
+    }, { accountId, mailbox, uid, part }),
   );
 
   server.registerTool(

@@ -170,6 +170,27 @@ function validEtag(value: string): boolean {
   return true;
 }
 
+function hasIcalendarProperty(raw: string, name: string): boolean {
+  const physicalLines = raw.replace(/\r\n/gu, "\n").replace(/\r/gu, "\n").split("\n");
+  const lines: string[] = [];
+  for (const line of physicalLines) {
+    if (/^[ \t]/u.test(line) && lines.length) lines[lines.length - 1] += line.slice(1);
+    else lines.push(line);
+  }
+  return lines.some((line) => {
+    const separator = line.search(/[;:]/u);
+    return separator > 0 && line.slice(0, separator).toUpperCase() === name.toUpperCase();
+  });
+}
+
+function withAttachmentPersistence(submittedRaw: string, persisted: CalendarItem): CalendarItem {
+  if (!hasIcalendarProperty(submittedRaw, "ATTACH")) return persisted;
+  return {
+    ...persisted,
+    requestedAttachmentPreserved: hasIcalendarProperty(persisted.rawIcalendar, "ATTACH"),
+  };
+}
+
 function xmlEscape(value: string): string {
   return value.replace(/[&<>"']/gu, (character) => ({
     "&": "&amp;",
@@ -845,11 +866,11 @@ export class DavClient {
     const collection = this.collectionUrl("calendar", calendarHref);
     if (!collection.pathname.endsWith("/")) collection.pathname += "/";
     const href = new URL(`${crypto.randomUUID()}.ics`, collection).toString();
-    const response = await this.write("calendar", href, raw, "text/calendar; charset=utf-8", undefined);
-    const etag = response.headers.get("ETag");
-    return etag
-      ? parseCalendar(raw, href, etag)
-      : this.getCalendarItem(href);
+    // A successful PUT only confirms that the server accepted the request. Read
+    // the resource back so the caller sees the server's persisted/normalized
+    // representation (including whether an ATTACH property survived).
+    await this.write("calendar", href, raw, "text/calendar; charset=utf-8", undefined);
+    return withAttachmentPersistence(raw, await this.getCalendarItem(href));
   }
 
   async updateCalendarItem(href: string, etag: string, input: CalendarItemInput): Promise<CalendarItem> {
@@ -857,9 +878,10 @@ export class DavClient {
     const raw = input.rawIcalendar ?? serializeCalendarItem(input);
     const provisional = parseCalendar(raw, href, etag);
     if (provisional.componentType !== input.componentType) throw new IcalendarParseError("Calendar resource type does not match the requested type");
-    const response = await this.write("calendar", href, raw, "text/calendar; charset=utf-8", etag);
-    const responseEtag = response.headers.get("ETag");
-    return responseEtag ? { ...provisional, etag: responseEtag } : this.getCalendarItem(href);
+    // Do not return the submitted body merely because PUT supplied an ETag:
+    // CalDAV servers may normalize or drop properties during persistence.
+    await this.write("calendar", href, raw, "text/calendar; charset=utf-8", etag);
+    return withAttachmentPersistence(raw, await this.getCalendarItem(href));
   }
 
   async createContact(addressBookHref: string, input: ContactInput): Promise<Contact> {

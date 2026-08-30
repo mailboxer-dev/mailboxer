@@ -222,6 +222,54 @@ function contentToBase64(content: Attachment["content"]): string {
   return "";
 }
 
+function normalizedAttachmentValue(value: string | null | undefined): string | null {
+  const normalized = value?.trim().toLowerCase();
+  return normalized || null;
+}
+
+function normalizedAttachmentContentId(value: string | null | undefined): string | null {
+  return normalizedAttachmentValue(value)?.replace(/^<|>$/gu, "") || null;
+}
+
+function attachmentPartScore(
+  attachment: Pick<Attachment, "filename" | "mimeType" | "disposition"> & { contentId?: string },
+  candidate: AttachmentPart,
+): number {
+  const filename = normalizedAttachmentValue(attachment.filename);
+  const candidateFilename = normalizedAttachmentValue(candidate.filename);
+  const contentId = normalizedAttachmentContentId(attachment.contentId);
+  const candidateContentId = normalizedAttachmentContentId(candidate.contentId);
+  const mimeType = normalizedAttachmentValue(attachment.mimeType);
+  const candidateMimeType = normalizedAttachmentValue(candidate.mimeType);
+  const disposition = normalizedAttachmentValue(attachment.disposition);
+  const candidateDisposition = normalizedAttachmentValue(candidate.disposition);
+
+  // A present but conflicting identity is not a usable match. This keeps an
+  // extra PostalMime attachment (for example text/calendar) from consuming
+  // the part descriptor for a later ticket.
+  if (contentId && candidateContentId && contentId !== candidateContentId) return -1;
+  if (mimeType && candidateMimeType && mimeType !== candidateMimeType) return -1;
+
+  let score = 0;
+  if (filename && candidateFilename && filename === candidateFilename) score += 100;
+  if (contentId && candidateContentId && contentId === candidateContentId) score += 50;
+  if (mimeType && candidateMimeType && mimeType === candidateMimeType) score += 10;
+  if (disposition && candidateDisposition && disposition === candidateDisposition) score += 1;
+  return score;
+}
+
+function matchAttachmentPart(
+  attachment: Pick<Attachment, "filename" | "mimeType" | "disposition"> & { contentId?: string },
+  parts: AttachmentPart[],
+  used: Set<string>,
+): AttachmentPart | undefined {
+  return parts
+    .filter((candidate) => !used.has(candidate.part))
+    .map((candidate, index) => ({ candidate, index, score: attachmentPartScore(attachment, candidate) }))
+    .filter(({ score }) => score >= 0)
+    .sort((left, right) => right.score - left.score || left.index - right.index)[0]?.candidate;
+}
+
 export async function parseRfc822(
   raw: Uint8Array,
   metadata: MessageMetadata,
@@ -234,7 +282,8 @@ export async function parseRfc822(
     maxNestingDepth: 20,
     maxRfc822NestingDepth: 5,
   });
-  const attachments = email.attachments.slice(0, MAX_ATTACHMENT_COUNT).map((attachment, index) => {
+  const usedAttachmentParts = new Set<string>();
+  const attachments = email.attachments.slice(0, MAX_ATTACHMENT_COUNT).map((attachment) => {
     const contentBase64 = contentToBase64(attachment.content);
     const size = (() => {
       try {
@@ -244,7 +293,8 @@ export async function parseRfc822(
       }
     })();
     if (size > MAX_ATTACHMENT_BYTES) throw new Error("Parsed attachment exceeds the safety limit");
-    const part = attachmentParts[index];
+    const part = matchAttachmentPart(attachment, attachmentParts, usedAttachmentParts);
+    if (part) usedAttachmentParts.add(part.part);
     return {
       part: part?.part ?? null,
       filename: attachment.filename,
