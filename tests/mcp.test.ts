@@ -102,6 +102,7 @@ describe("stateless MCP handler", () => {
     };
     const tools = listing.result?.tools ?? [];
     expect(tools.find((tool) => tool.name === "list_accounts")?.annotations).toMatchObject({ readOnlyHint: true });
+    expect(tools.find((tool) => tool.name === "send_email")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: true });
     expect(tools.find((tool) => tool.name === "list_calendars")?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
     expect(tools.find((tool) => tool.name === "create_calendar_item")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false });
     expect(tools.find((tool) => tool.name === "delete_contact")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });

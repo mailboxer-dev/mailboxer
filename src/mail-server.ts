@@ -344,7 +344,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
           contentId: z.string().max(320).optional(),
         })).max(MAX_ATTACHMENT_COUNT).optional().default([]),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async ({ accountId, to, cc, bcc, replyTo, subject, text, html, attachments }) => withToolSpan("send_email", async () => {
       try {
