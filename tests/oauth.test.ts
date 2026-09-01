@@ -267,9 +267,22 @@ describe("public onboarding routes", () => {
     expect(await head.text()).toBe("");
   });
 
+  it("serves the OpenAI Apps domain verification challenge", async () => {
+    const authFetch = authFetchFor();
+    const path = "/.well-known/openai-apps-challenge";
+    const get = await authFetch(new Request(`https://hosted.example${path}`), oauthEnv(), context);
+    expect(get.status).toBe(200);
+    expect(get.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
+    expect(await get.text()).toBe("wsetZFtnQmQTZWCkDGGthIkRpBFDj9yOks1V3O2yPO8");
+
+    const head = await authFetch(new Request(`https://hosted.example${path}`, { method: "HEAD" }), oauthEnv(), context);
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+  });
+
   it("returns method errors for public routes without changing the unknown-route contract", async () => {
     const authFetch = authFetchFor();
-    for (const path of ["/", "/agent-setup/prompt.md", "/health"]) {
+    for (const path of ["/", "/agent-setup/prompt.md", "/.well-known/openai-apps-challenge", "/health"]) {
       const response = await authFetch(new Request(`https://hosted.example${path}`, { method: "POST" }), oauthEnv(), context);
       expect(response.status).toBe(405);
       expect(response.headers.get("Allow")).toBe("GET, HEAD");

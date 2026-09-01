@@ -45,6 +45,7 @@ const MAX_AUTH_ATTEMPTS = 5;
 const MAX_FORM_BYTES = 16 * 1024;
 const STATE_KEY_PREFIX = "mail-oauth:state:";
 const STATE_COOKIE_NAME = "mcp_oauth_state";
+const OPENAI_APPS_CHALLENGE = "wsetZFtnQmQTZWCkDGGthIkRpBFDj9yOks1V3O2yPO8";
 const AUTH_SCOPES = [...RESOURCE_SCOPES, "offline_access"] as const;
 const STATE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/u;
 interface StoredAuthState {
@@ -1262,6 +1263,12 @@ export function createCredentialAuthHandler(dependencies: CredentialAuthDependen
               agentSetupPrompt(landingPageModel(request)),
               "text/markdown; charset=utf-8",
             );
+          }
+          return methodNotAllowed("GET, HEAD");
+        }
+        if (url.pathname === "/.well-known/openai-apps-challenge") {
+          if (request.method === "GET" || request.method === "HEAD") {
+            return publicTextResponse(request, OPENAI_APPS_CHALLENGE, "text/plain; charset=utf-8");
           }
           return methodNotAllowed("GET, HEAD");
         }
