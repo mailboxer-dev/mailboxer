@@ -4,18 +4,14 @@ import {
 } from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
 import {
-  AccountVaultError,
-  addDraftAccount,
+  AccountError,
   commitAccountDraft,
   deleteAccountDraft,
   findAccountDraft,
   findAccountDraftByEmail,
   loadAccountDraft,
   newAccountDraft,
-  removeDraftAccount,
-  replaceDraftAccount,
   saveAccountDraft,
-  setDraftDefault,
   verifyAccountSubmission,
   type AccountDraft,
   type AccountSubmission,
@@ -26,7 +22,6 @@ import {
   renderAuthPage,
   type AccountFormModel,
   type AccountFormStep,
-  type AccountFormTarget,
   type LandingPageModel,
 } from "./auth-ui";
 import { getCredentialsEncryptionSecret } from "./config";
@@ -295,6 +290,8 @@ You are helping the user connect their current AI agent to Mailboxer, which give
 
 Mailboxer MCP address: \`${page.mcpUrl}\`
 
+Each connection authorizes one account. To use more accounts, create separately named connections to this same address and sign in to each independently.
+
 Do not ask the user for a mailbox password, request that they paste one into this chat, or handle one yourself. Mailboxer collects and protects sign-in details in its existing browser authorization flow.
 
 ## Codex CLI
@@ -307,6 +304,17 @@ codex mcp login mailboxer
 \`\`\`
 
 If the login command opens a browser, have the user finish signing in there. Keep the mailbox password in that browser flow.
+
+## Pi
+
+Run these commands in the user's terminal:
+
+\`\`\`sh
+pi mcp add mailboxer --url ${page.mcpUrl}
+pi mcp login mailboxer
+\`\`\`
+
+Complete browser sign-in. Each connection authorizes one account. For additional accounts, repeat with a different connection name, such as \`mailboxer-work\`, and the same MCP address.
 
 ## Claude Code
 
@@ -502,7 +510,6 @@ function renderPasswordPage(
     state,
     target: "start",
     step: "password",
-    accountId: account.accountId,
     account: {
       ...accountModel,
       label: "",
@@ -518,7 +525,6 @@ function renderNewAccountPasswordPage(
   state: string,
   stored: StoredAuthState,
   address: string,
-  target: "start" | "add" = "start",
   errorMessage?: string,
 ): string {
   const form = new URLSearchParams({ address, preset: detectAccountPreset(address) });
@@ -528,7 +534,7 @@ function renderNewAccountPasswordPage(
     title: "Connect your account",
     clientName: stored.clientName,
     state,
-    target,
+    target: "start",
     step: "new-password",
     account: accountFormModel(form, undefined, { mail: false, calendar: false, contacts: false }),
     ...(errorMessage ? { message: { kind: "error" as const, text: errorMessage } } : {}),
@@ -566,53 +572,6 @@ function applyDiscoveredSettings(form: URLSearchParams, settings: DiscoveredAcco
   if (settings.caldavUrl) form.set("caldav_url", settings.caldavUrl);
   if (settings.carddavUrl) form.set("carddav_url", settings.carddavUrl);
   form.set("dav_user", settings.davUser);
-}
-
-function renderAccountFormPage(
-  state: string,
-  stored: StoredAuthState,
-  target: "add" | "edit",
-  errorMessage?: string,
-  form?: URLSearchParams,
-  existing?: StoredMailAccount,
-): string {
-  const heading = target === "add" ? "Add an account" : "Edit account";
-  return renderAuthPage({
-    version: 1,
-    kind: "account-form",
-    title: heading,
-    clientName: stored.clientName,
-    state,
-    target,
-    step: target === "add" && !form ? "email" : "config",
-    ...(existing ? { accountId: existing.accountId } : {}),
-    account: accountFormModel(form, existing),
-    ...(errorMessage ? { message: { kind: "error" as const, text: errorMessage } } : {}),
-  });
-}
-
-function renderManagementPage(
-  state: string,
-  stored: StoredAuthState,
-  draft: AccountDraft,
-  message?: string,
-): string {
-  return renderAuthPage({
-    version: 1,
-    kind: "management",
-    title: "Your accounts",
-    clientName: stored.clientName,
-    state,
-    accounts: draft.accounts.map((account) => ({
-      accountId: account.accountId,
-      label: account.label,
-      address: account.address,
-      preset: account.preset,
-      capabilities: account.capabilities,
-      isDefault: account.accountId === draft.defaultAccountId,
-    })),
-    ...(message ? { message: { kind: "status" as const, text: message } } : {}),
-  });
 }
 
 async function readBoundedBody(request: Request): Promise<Uint8Array> {
@@ -673,7 +632,7 @@ async function deleteWizardState(env: OAuthEnv, state: string): Promise<void> {
 
 function accountSubmissionFromForm(form: URLSearchParams): AccountSubmission {
   const preset = firstValue(form, ["preset"]);
-  if (preset !== "icloud" && preset !== "custom") throw new AccountVaultError("Select a supported account provider");
+  if (preset !== "icloud" && preset !== "custom") throw new AccountError("Select a supported account provider");
   const numberValue = (name: string): number | undefined => {
     const value = form.get(name);
     if (value === null || value.trim() === "") return undefined;
@@ -706,43 +665,6 @@ function accountSubmissionFromForm(form: URLSearchParams): AccountSubmission {
   };
 }
 
-function accountSubmissionFromStored(account: StoredMailAccount): AccountSubmission {
-  const { config } = account;
-  if (account.preset === "icloud") {
-    return {
-      preset: "icloud",
-      label: account.label,
-      address: account.address,
-      appPassword: config.password,
-      enableMail: account.capabilities.mail,
-      enableCalendar: account.capabilities.calendar,
-      enableContacts: account.capabilities.contacts,
-    };
-  }
-  return {
-    preset: "custom",
-    label: account.label,
-    address: account.address,
-    enableMail: account.capabilities.mail,
-    enableCalendar: account.capabilities.calendar,
-    enableContacts: account.capabilities.contacts,
-    imapHost: config.imapHost,
-    imapPort: config.imapPort,
-    imapTlsMode: config.imapTlsMode,
-    imapUser: config.imapUser,
-    imapPassword: config.password,
-    smtpHost: config.smtpHost,
-    smtpPort: config.smtpPort,
-    smtpTlsMode: config.smtpTlsMode,
-    smtpUser: config.smtpUser,
-    smtpPassword: config.smtpPassword,
-    sameSmtpCredentials: config.smtpUser === config.imapUser && config.smtpPassword === config.password,
-    caldavUrl: account.davConfig?.caldavUrl,
-    carddavUrl: account.davConfig?.carddavUrl,
-    davUser: account.davConfig?.username ?? config.imapUser,
-  };
-}
-
 async function storedAccountPasswordMatches(account: StoredMailAccount, password: string): Promise<boolean> {
   const encoder = new TextEncoder();
   const candidate = account.preset === "icloud" ? password.trim() : password;
@@ -765,22 +687,14 @@ function stateCookieFor(request: Request, state: string, secret: string): Promis
 }
 
 function isVerificationError(error: unknown): boolean {
-  return error instanceof MailCredentialError || error instanceof AccountVaultError || error instanceof z.ZodError;
+  return error instanceof MailCredentialError || error instanceof AccountError || error instanceof z.ZodError;
 }
 
 function verificationFailureMessage(error?: unknown): string {
-  if (error instanceof AccountVaultError && error.message.startsWith("We couldn't connect ")) {
+  if (error instanceof AccountError && error.message.startsWith("We couldn't connect ")) {
     return `${error.message}. Check those settings or turn off that service.`;
   }
   return "We couldn't sign in. Check the details and try again.";
-}
-
-function accountManagementFailureMessage(error: AccountVaultError): string {
-  if (error.message.includes("final account")) return "You need to keep at least one account.";
-  if (error.message.includes("at most")) return "You've reached the account limit.";
-  if (error.message.includes("already attached")) return "That email is already connected elsewhere.";
-  if (error.message.includes("changed in another reconnect")) return "Your accounts changed elsewhere. Start again to see the latest version.";
-  return "We couldn't save that change. Try again.";
 }
 
 async function beginCredentialAuthorization(request: Request, env: OAuthEnv): Promise<Response> {
@@ -872,8 +786,19 @@ async function completeAuthorization(
   const selectedScopes = automaticallyGrantedScopes(stored);
   const grantedResourceScopes = resourceScopes(selectedScopes);
   const action = form.get("action") ?? "verify";
-  const targetValue = form.get("target");
-  const target: AccountFormTarget = targetValue === "add" || targetValue === "edit" ? targetValue : "start";
+  async function finishAuthorization(draft: AccountDraft): Promise<Response> {
+    const committed = await commitAccountDraft(env, draft);
+    try {
+      const result = await env.OAUTH_PROVIDER.completeAuthorization({
+        request: stored!.request, userId: committed.userId, metadata: { clientName: stored!.clientName },
+        scope: selectedScopes, props: { userId: committed.userId, accountVersion: 3, scopes: grantedResourceScopes },
+      });
+      return redirectWithCookie(result.redirectTo, clearStateCookie(request, stateToken));
+    } finally {
+      await deleteWizardState(env, stateToken);
+    }
+  }
+
   const stateWithSelection: StoredAuthState = { ...stored, grantedScopes: selectedScopes };
 
   if (action === "restart") {
@@ -899,29 +824,10 @@ async function completeAuthorization(
     }
     const address = addressResult.data.toLowerCase();
     form.set("address", address);
-    if (target === "add") {
-      const draft = await loadAccountDraft(env, stateToken);
-      if (!draft) return jsonError("Expired authorization state", 400);
-      if (draft.accounts.some((account) => account.address.toLowerCase() === address)) {
-        return htmlResponse(
-          renderManagementPage(stateToken, stateWithSelection, draft, "That account is already in your list."),
-          callbackFormAction,
-          200,
-          await stateCookieFor(request, stateToken, secret),
-        );
-      }
-      await persistAuthState(env, stateToken, stateWithSelection);
-      return htmlResponse(
-        renderNewAccountPasswordPage(stateToken, stateWithSelection, address, "add"),
-        callbackFormAction,
-        200,
-        await stateCookieFor(request, stateToken, secret),
-      );
-    }
     const existingDraft = await findAccountDraftByEmail(env, address);
     if (existingDraft) {
-      const account = existingDraft.accounts.find((candidate) => candidate.address.toLowerCase() === address);
-      if (!account) throw new AccountVaultError("The saved account could not be opened");
+      const account = existingDraft.account;
+      if (!account) throw new AccountError("The saved account could not be opened");
       await saveAccountDraft(env, stateToken, existingDraft);
       await persistAuthState(env, stateToken, stateWithSelection);
       return htmlResponse(
@@ -940,23 +846,29 @@ async function completeAuthorization(
     );
   }
 
+  if (action === "new_password") {
+    const draft = await loadAccountDraft(env, stateToken);
+    if (!draft) return jsonError("Expired authorization state", 400);
+    await deleteAccountDraft(env, stateToken);
+    return htmlResponse(
+      renderNewAccountPasswordPage(stateToken, stateWithSelection, draft.account.address),
+      callbackFormAction,
+      200,
+      await stateCookieFor(request, stateToken, secret),
+    );
+  }
+
   if (action === "unlock") {
     const draft = await loadAccountDraft(env, stateToken);
     if (!draft) return jsonError("Expired authorization state", 400);
-    const account = draft.accounts.find((candidate) => candidate.accountId === (form.get("account_id") ?? ""));
-    if (!account) throw new AccountVaultError("The saved account could not be opened");
+    const account = draft.account;
+    if (!account) throw new AccountError("The saved account could not be opened");
     try {
       const password = z.string().min(1).max(256).parse(form.get("account_password") ?? "");
       if (!await storedAccountPasswordMatches(account, password)) {
-        throw new AccountVaultError("The saved account password did not match");
+        throw new AccountError("The saved account password did not match");
       }
-      await persistAuthState(env, stateToken, stateWithSelection);
-      return htmlResponse(
-        renderManagementPage(stateToken, stateWithSelection, draft, "You're signed in. Review your accounts, then save and exit."),
-        callbackFormAction,
-        200,
-        await stateCookieFor(request, stateToken, secret),
-      );
+      return finishAuthorization(draft);
     } catch (error) {
       if (!isVerificationError(error)) throw error;
       const attempts = stored.attempts + 1;
@@ -983,7 +895,7 @@ async function completeAuthorization(
     if (!addressResult.success || !passwordResult.success) {
       const address = addressResult.success ? addressResult.data.toLowerCase() : "";
       return htmlResponse(
-        renderNewAccountPasswordPage(stateToken, stateWithSelection, address, target === "add" ? "add" : "start", "Enter your account password."),
+        renderNewAccountPasswordPage(stateToken, stateWithSelection, address, "Enter your account password."),
         callbackFormAction,
         400,
         await stateCookieFor(request, stateToken, secret),
@@ -1002,9 +914,7 @@ async function completeAuthorization(
       form.set("label", address.split("@").at(-1) ?? "Email");
       form.set("service_options_present", "1");
       return htmlResponse(
-        target === "add"
-          ? renderAccountFormPage(stateToken, stateWithSelection, "add", "We couldn't find all of your settings. Add or correct them below.", form)
-          : renderStartPage(stateToken, stateWithSelection, "We couldn't find all of your settings. Add or correct them below.", form, "config"),
+        renderStartPage(stateToken, stateWithSelection, "We couldn't find all of your settings. Add or correct them below.", form, "config"),
         callbackFormAction,
         200,
         await stateCookieFor(request, stateToken, secret),
@@ -1012,133 +922,11 @@ async function completeAuthorization(
     }
   }
 
-  if (action === "add" || action === "edit") {
-    const draft = await loadAccountDraft(env, stateToken);
-    if (!draft) return jsonError("Expired authorization state", 400);
-    const existing = action === "edit" ? draft.accounts.find((account) => account.accountId === (form.get("account_id") ?? "")) : undefined;
-    await persistAuthState(env, stateToken, stateWithSelection);
-    return htmlResponse(
-      renderAccountFormPage(stateToken, stateWithSelection, action, undefined, undefined, existing),
-      callbackFormAction,
-      200,
-      await stateCookieFor(request, stateToken, secret),
-    );
-  }
-
-  if (action === "list") {
-    const draft = await loadAccountDraft(env, stateToken);
-    if (!draft) return jsonError("Expired authorization state", 400);
-    await persistAuthState(env, stateToken, stateWithSelection);
-    return htmlResponse(
-      renderManagementPage(stateToken, stateWithSelection, draft),
-      callbackFormAction,
-      200,
-      await stateCookieFor(request, stateToken, secret),
-    );
-  }
-
-  if (action === "remove" || action === "set_default" || action === "test" || action === "continue") {
-    const draft = await loadAccountDraft(env, stateToken);
-    if (!draft) return jsonError("Expired authorization state", 400);
-    const accountId = form.get("account_id") ?? "";
-    const account = draft.accounts.find((candidate) => candidate.accountId === accountId);
-    try {
-      if (action === "remove") {
-        const nextDraft = removeDraftAccount(draft, accountId);
-        await saveAccountDraft(env, stateToken, nextDraft);
-        await persistAuthState(env, stateToken, stateWithSelection);
-        return htmlResponse(
-          renderManagementPage(stateToken, stateWithSelection, nextDraft, "Account deleted."),
-          callbackFormAction,
-          200,
-          await stateCookieFor(request, stateToken, secret),
-        );
-      }
-      if (action === "set_default") {
-        const nextDraft = setDraftDefault(draft, accountId);
-        await saveAccountDraft(env, stateToken, nextDraft);
-        await persistAuthState(env, stateToken, stateWithSelection);
-        return htmlResponse(
-          renderManagementPage(stateToken, stateWithSelection, nextDraft, "Your default account was updated."),
-          callbackFormAction,
-          200,
-          await stateCookieFor(request, stateToken, secret),
-        );
-      }
-      if (action === "test") {
-        if (!account) throw new AccountVaultError("Unknown accountId");
-        try {
-          await dependencies.verifyAccountSubmission(env, accountSubmissionFromStored(account), {}, account.accountId);
-        } catch (error) {
-          if (!isVerificationError(error)) throw error;
-          const attempts = stored.attempts + 1;
-          if (attempts >= MAX_AUTH_ATTEMPTS) {
-            await deleteWizardState(env, stateToken);
-            const response = jsonError("Account verification failed too many times", 401);
-            response.headers.set("Set-Cookie", clearStateCookie(request, stateToken));
-            return response;
-          }
-          const nextState = { ...stateWithSelection, attempts };
-          await persistAuthState(env, stateToken, nextState);
-          return htmlResponse(
-            renderManagementPage(stateToken, nextState, draft, "We couldn't sign in to that account. Check its password and try again."),
-            callbackFormAction,
-            401,
-            await stateCookieFor(request, stateToken, secret),
-          );
-        }
-        await persistAuthState(env, stateToken, stateWithSelection);
-        return htmlResponse(
-          renderManagementPage(stateToken, stateWithSelection, draft, "The account is working."),
-          callbackFormAction,
-          200,
-          await stateCookieFor(request, stateToken, secret),
-        );
-      }
-      const committed = await commitAccountDraft(env, draft);
-      try {
-        const result = await env.OAUTH_PROVIDER.completeAuthorization({
-          request: stored.request,
-          userId: committed.userId,
-          metadata: { clientName: stored.clientName },
-          scope: selectedScopes,
-          props: { userId: committed.userId, scopes: grantedResourceScopes },
-        });
-        return redirectWithCookie(result.redirectTo, clearStateCookie(request, stateToken));
-      } finally {
-        await deleteWizardState(env, stateToken);
-      }
-    } catch (error) {
-      if (error instanceof AccountVaultError) {
-        return htmlResponse(
-          renderManagementPage(stateToken, stateWithSelection, draft, accountManagementFailureMessage(error)),
-          callbackFormAction,
-          409,
-          await stateCookieFor(request, stateToken, secret),
-        );
-      }
-      throw error;
-    }
-  }
-
-  let submission = accountSubmissionFromForm(form);
-  const existingId = target === "edit" ? form.get("account_id") ?? undefined : undefined;
-  if (target === "edit" && (submission.preset === "icloud" || submission.preset === "custom")) {
-    const draft = await loadAccountDraft(env, stateToken);
-    if (!draft) return jsonError("Expired authorization state", 400);
-    const existing = draft.accounts.find((account) => account.accountId === existingId && account.preset === submission.preset);
-    if (!existing) throw new AccountVaultError("The saved account could not be opened");
-    submission = submission.preset === "icloud"
-      ? { ...submission, appPassword: submission.appPassword ?? existing.config.password }
-      : {
-        ...submission,
-        imapPassword: submission.imapPassword ?? existing.config.password,
-        smtpPassword: submission.smtpPassword ?? existing.config.smtpPassword,
-      };
-  }
+  if (action !== "verify" && action !== "discover") return jsonError("Unknown authorization action", 400);
+  const submission = accountSubmissionFromForm(form);
   let verifiedAccount: StoredMailAccount;
   try {
-    verifiedAccount = await dependencies.verifyAccountSubmission(env, submission, {}, existingId);
+    verifiedAccount = await dependencies.verifyAccountSubmission(env, submission, {});
   } catch (error) {
     if (!isVerificationError(error)) throw error;
     const attempts = stored.attempts + 1;
@@ -1150,17 +938,6 @@ async function completeAuthorization(
     }
     const nextState: StoredAuthState = { ...stateWithSelection, attempts };
     await persistAuthState(env, stateToken, nextState);
-    if (target === "add" || target === "edit") {
-      const draft = await loadAccountDraft(env, stateToken);
-      if (!draft) return jsonError("Expired authorization state", 400);
-      const existing = target === "edit" ? draft.accounts.find((account) => account.accountId === (form.get("account_id") ?? "")) : undefined;
-      return htmlResponse(
-        renderAccountFormPage(stateToken, nextState, target, verificationFailureMessage(error), form, existing),
-        callbackFormAction,
-        401,
-        await stateCookieFor(request, stateToken, secret),
-      );
-    }
     return htmlResponse(
       renderStartPage(stateToken, nextState, verificationFailureMessage(error), form, "config"),
       callbackFormAction,
@@ -1169,63 +946,9 @@ async function completeAuthorization(
     );
   }
 
-  let draft: AccountDraft;
-  let matchedExistingProfile = false;
-  try {
-    if (target === "start") {
-      const existingDraft = await findAccountDraft(env, verifiedAccount);
-      matchedExistingProfile = existingDraft !== null;
-      draft = existingDraft ?? newAccountDraft(verifiedAccount);
-    } else {
-      const existingDraft = await loadAccountDraft(env, stateToken);
-      if (!existingDraft) return jsonError("Expired authorization state", 400);
-      draft = target === "add"
-        ? addDraftAccount(existingDraft, verifiedAccount)
-        : replaceDraftAccount(existingDraft, verifiedAccount);
-    }
-  } catch (error) {
-    if (!(error instanceof AccountVaultError)) throw error;
-    const attempts = target === "start" ? stored.attempts + 1 : stored.attempts;
-    if (attempts >= MAX_AUTH_ATTEMPTS) {
-      await deleteWizardState(env, stateToken);
-      const response = jsonError("Account verification failed too many times", 401);
-      response.headers.set("Set-Cookie", clearStateCookie(request, stateToken));
-      return response;
-    }
-    const nextState: StoredAuthState = { ...stateWithSelection, attempts };
-    await persistAuthState(env, stateToken, nextState);
-    if (target === "start") {
-      return htmlResponse(
-        renderStartPage(stateToken, nextState, "We couldn't open your saved accounts. Check the details and try again.", form, "config"),
-        callbackFormAction,
-        401,
-        await stateCookieFor(request, stateToken, secret),
-      );
-    }
-    const existingDraft = await loadAccountDraft(env, stateToken);
-    if (!existingDraft) return jsonError("Expired authorization state", 400);
-    const existing = target === "edit" ? existingDraft.accounts.find((account) => account.accountId === (form.get("account_id") ?? "")) : undefined;
-    return htmlResponse(
-      renderAccountFormPage(stateToken, nextState, target, "We couldn't save that account. Check the details and try again.", form, existing),
-      callbackFormAction,
-      409,
-      await stateCookieFor(request, stateToken, secret),
-    );
-  }
-
-  await saveAccountDraft(env, stateToken, draft);
-  await persistAuthState(env, stateToken, stateWithSelection);
-  const resultMessage = target === "start"
-    ? matchedExistingProfile
-      ? "Your saved accounts are ready. Review them, then save and exit."
-      : "Account added. Review it, then save and exit."
-    : "Account saved.";
-  return htmlResponse(
-    renderManagementPage(stateToken, stateWithSelection, draft, resultMessage),
-    callbackFormAction,
-    200,
-    await stateCookieFor(request, stateToken, secret),
-  );
+  const existing = await findAccountDraft(env, verifiedAccount);
+  const draft = existing ? { ...existing, account: { ...verifiedAccount, accountId: existing.account.accountId } } : newAccountDraft(verifiedAccount);
+  return finishAuthorization(draft);
 }
 
 function isCredentialConfigurationError(error: unknown): boolean {

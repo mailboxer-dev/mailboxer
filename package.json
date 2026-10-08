@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A stateless multi-account Email MCP server on Cloudflare Workers with an iCloud preset and custom IMAP/SMTP support.",
+  "description": "A stateless single-account Email MCP server on Cloudflare Workers with an iCloud preset and custom IMAP/SMTP support.",
   "scripts": {
     "build:ui": "vite build",
     "dev:ui": "vite",
@@ -23,7 +23,7 @@
         "description": "OAuth sessions, tokens, and encrypted account details. Give this shared namespace a unique name such as `<worker-name>-oauth`."
       },
       "MAIL_CREDENTIALS_ENCRYPTION_KEY": {
-        "description": "Encryption key for per-user account vaults. Generate with `openssl rand -hex 32`; do not reuse an email password."
+        "description": "Encryption key for stored account credentials. Generate with `openssl rand -hex 32`; do not reuse an email password."
       }
     }
   },

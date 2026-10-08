@@ -4,6 +4,21 @@
 
 mailboxer connects your email, calendars, contacts, and reminders to any agent through an always-on MCP. It is designed for people who want to use their own accounts without deploying and configuring several separate services. iCloud works out of the box, and mailboxer automatically discovers standard IMAP, SMTP, CalDAV, and CardDAV settings for other providers when available.
 
+Each MCP connection authorizes one account. To connect personal and work accounts, add this same `/mcp` URL under separate connection names and sign in to each account independently. Tools always use the account authorized for their connection; `get_account` returns its identity and available services.
+
+For Pi's built-in MCP support:
+
+```bash
+pi mcp add mailboxer-personal --url https://YOUR-WORKER/mcp
+pi mcp login mailboxer-personal
+pi mcp add mailboxer-work --url https://YOUR-WORKER/mcp
+pi mcp login mailboxer-work
+```
+
+Pi stores separate OAuth credentials for each name and URL. For other clients, create separate connections to the same endpoint using their connection settings.
+
+**Upgrading from multi-account support:** existing OAuth connections must reconnect. Sign in to each account separately; saved credentials remain available during sign-in, but sibling accounts are never included in the new connection. Existing vault records are retained for reconnecting remaining accounts. `list_accounts` is replaced by `get_account`, and resource tools no longer accept `accountId`. Register separate connections for any workflows that previously selected several accounts.
+
 ## Deploy it yourself
 
 Deploy mailboxer to your own Cloudflare account with the button below. Cloudflare provisions the Worker and its private storage; you only need to provide a unique encryption secret. Email credentials are added later through mailboxer’s sign-in page and are never committed to the repository.

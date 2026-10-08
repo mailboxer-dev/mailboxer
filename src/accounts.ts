@@ -10,12 +10,11 @@ import { DavClient } from "./dav/client";
 import { logFailure } from "./diagnostics";
 import { ImapClient } from "./imap/client";
 import { SmtpClient } from "./smtp/client";
-import { withSpan } from "./tracing";
 import { customDavConfig, ICLOUD_DAV_CONFIG } from "./providers";
 import type {
   AccountCapability,
   AccountSummary,
-  AccountVaultV2,
+  AccountRecord,
   AppEnv,
   AuthProps,
   MailConfig,
@@ -26,12 +25,12 @@ import type {
 const VAULT_KEY_PREFIX = "mail:account-vault:v2:";
 const INDEX_KEY_PREFIX = "mail:account-index:v2:";
 const EMAIL_INDEX_KEY_PREFIX = "mail:account-email-index:v2:";
-const DRAFT_KEY_PREFIX = "mail:account-draft:v2:";
+const DRAFT_KEY_PREFIX = "mail:account-draft:v3:";
+// Keep the legacy key derivation so saved v2 credentials remain readable during reconnect.
 const VAULT_CONTEXT = "email-mcp account vault v2\u0000";
 const INDEX_CONTEXT = "email-mcp account locator v2\u0000";
 const EMAIL_INDEX_CONTEXT = "email-mcp account email index v2\u0000";
 const MAX_VAULT_BYTES = 96 * 1024;
-const MAX_ACCOUNTS = 10;
 export const ACCOUNT_DRAFT_TTL_SECONDS = 10 * 60;
 
 const hostnameSchema = z.string().trim().min(4).max(253);
@@ -69,13 +68,13 @@ const storedAccountSchema = z.object({
     username: z.string().min(1).max(320).optional(),
   }).optional(),
 });
-const vaultSchema = z.object({
-  version: z.literal(2),
+const recordSchema = z.object({
+  version: z.literal(3),
   userId: userIdSchema,
   revision: z.number().int().min(1),
-  defaultAccountId: accountIdSchema,
-  accounts: z.array(storedAccountSchema).min(1).max(MAX_ACCOUNTS),
+  account: storedAccountSchema,
 });
+const ACCOUNT_KEY_PREFIX = "mail:account:v3:";
 const envelopeSchema = z.object({
   version: z.literal(2),
   iv: z.string().min(1).max(64),
@@ -85,15 +84,12 @@ const envelopeSchema = z.object({
 export interface AccountDraft {
   userId: string;
   baseRevision: number | null;
-  defaultAccountId: string;
-  accounts: StoredMailAccount[];
+  account: StoredMailAccount;
 }
-
 const draftSchema = z.object({
   userId: userIdSchema,
   baseRevision: z.number().int().min(1).nullable(),
-  defaultAccountId: accountIdSchema,
-  accounts: z.array(storedAccountSchema).min(1).max(MAX_ACCOUNTS),
+  account: storedAccountSchema,
 });
 
 export interface AccountSubmission {
@@ -126,10 +122,10 @@ export interface VerifyAccountDependencies {
   davVerify?: (config: MailConfig, davConfig: DavConfig, service: "calendar" | "contacts") => Promise<void>;
 }
 
-export class AccountVaultError extends Error {
+export class AccountError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = "AccountVaultError";
+    this.name = "AccountError";
   }
 }
 
@@ -166,7 +162,7 @@ async function aesKey(secret: string): Promise<CryptoKey> {
 
 async function encryptRecord(value: unknown, aad: string, secret: string): Promise<string> {
   const plaintext = bytes(JSON.stringify(value));
-  if (plaintext.byteLength > MAX_VAULT_BYTES) throw new AccountVaultError("Account configuration is too large");
+  if (plaintext.byteLength > MAX_VAULT_BYTES) throw new AccountError("Account configuration is too large");
   const iv = new Uint8Array(12);
   crypto.getRandomValues(iv);
   const ciphertext = await crypto.subtle.encrypt(
@@ -191,8 +187,8 @@ async function decryptRecord(value: string, aad: string, secret: string): Promis
     );
     return JSON.parse(new TextDecoder().decode(plaintext)) as unknown;
   } catch (error) {
-    if (error instanceof AccountVaultError) throw error;
-    throw new AccountVaultError("Stored account configuration cannot be decrypted");
+    if (error instanceof AccountError) throw error;
+    throw new AccountError("Stored account configuration cannot be decrypted");
   }
 }
 
@@ -207,17 +203,17 @@ function validateHostname(value: string, field: string): string {
   });
   const hostname = value.trim().toLowerCase().replace(/\.$/u, "");
   if (!hostnameSchema.safeParse(hostname).success || hostname.includes("..") || !hostname.includes(".")) {
-    throw new AccountVaultError(`Enter a valid public hostname for ${field}`);
+    throw new AccountError(`Enter a valid public hostname for ${field}`);
   }
   if (/^\d{1,3}(?:\.\d{1,3}){3}$/u.test(hostname) || hostname.includes(":") || hasControl) {
-    throw new AccountVaultError(`${field} must be a hostname, not an IP address`);
+    throw new AccountError(`${field} must be a hostname, not an IP address`);
   }
   if (/(?:^|\.)(?:localhost|local|internal|home|lan|test|invalid)$/u.test(hostname)) {
-    throw new AccountVaultError(`${field} must be a public hostname`);
+    throw new AccountError(`${field} must be a public hostname`);
   }
   const labels = hostname.split(".");
   if (labels.some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(label))) {
-    throw new AccountVaultError(`Enter a valid public hostname for ${field}`);
+    throw new AccountError(`Enter a valid public hostname for ${field}`);
   }
   return hostname;
 }
@@ -226,7 +222,7 @@ function assertTransport(port: number, mode: "implicit" | "starttls", service: "
   const valid = service === "IMAP"
     ? (port === 993 && mode === "implicit") || (port === 143 && mode === "starttls")
     : (port === 465 && mode === "implicit") || ([587, 2525].includes(port) && mode === "starttls");
-  if (!valid) throw new AccountVaultError(`Unsupported ${service} port and TLS mode combination`);
+  if (!valid) throw new AccountError(`Unsupported ${service} port and TLS mode combination`);
 }
 
 function capabilitiesFor(submission: AccountSubmission): StoredMailAccount["capabilities"] {
@@ -236,7 +232,7 @@ function capabilitiesFor(submission: AccountSubmission): StoredMailAccount["capa
     contacts: submission.enableContacts === true,
   };
   if (!capabilities.mail && !capabilities.calendar && !capabilities.contacts) {
-    throw new AccountVaultError("Enable at least one service for this account");
+    throw new AccountError("Enable at least one service for this account");
   }
   return capabilities;
 }
@@ -319,7 +315,7 @@ async function verifyConfig(
       calendar: "calendar",
       contacts: "contacts",
     };
-    throw new AccountVaultError(`We couldn't connect ${failed.map((service) => labels[service]).join(", ")}`);
+    throw new AccountError(`We couldn't connect ${failed.map((service) => labels[service]).join(", ")}`);
   }
 }
 
@@ -359,7 +355,7 @@ export async function verifyAccountSubmission(
     try {
       davConfig = customDavConfig(submission.caldavUrl, submission.carddavUrl, submission.davUser ?? config.imapUser, capabilities);
     } catch (error) {
-      throw new AccountVaultError(error instanceof Error ? error.message : "Enter valid calendar and contacts server addresses");
+      throw new AccountError(error instanceof Error ? error.message : "Enter valid calendar and contacts server addresses");
     }
     await verifyConfig(config, davConfig ?? {}, capabilities, dependencies);
   }
@@ -396,270 +392,132 @@ async function locatorIndexKey(locator: string, secret: string): Promise<string>
   return `${INDEX_KEY_PREFIX}${await indexDigest(locator, INDEX_CONTEXT, secret)}`;
 }
 
-async function indexKey(account: StoredMailAccount, secret: string): Promise<string> {
-  return locatorIndexKey(canonicalLocator(account), secret);
-}
-
 async function emailIndexKey(email: string, secret: string): Promise<string> {
   return `${EMAIL_INDEX_KEY_PREFIX}${await indexDigest(normalizeAddress(email), EMAIL_INDEX_CONTEXT, secret)}`;
 }
 
-function validateVault(vault: AccountVaultV2): AccountVaultV2 {
-  const parsed = vaultSchema.parse(vault);
-  const ids = new Set(parsed.accounts.map((account) => account.accountId));
-  const locators = new Set(parsed.accounts.map(canonicalLocator));
-  const addresses = new Set(parsed.accounts.map((account) => normalizeAddress(account.address)));
-  if (ids.size !== parsed.accounts.length || locators.size !== parsed.accounts.length || addresses.size !== parsed.accounts.length || !ids.has(parsed.defaultAccountId)) {
-    throw new AccountVaultError("Account vault has an invalid account list or default account");
-  }
-  return parsed;
-}
-
 export function newAccountDraft(account: StoredMailAccount): AccountDraft {
-  const userId = randomId("usr_");
-  return { userId, baseRevision: null, defaultAccountId: account.accountId, accounts: [account] };
+  return { userId: randomId("usr_"), baseRevision: null, account };
 }
 
-export async function loadAccountVault(env: AppEnv, userId: string): Promise<AccountVaultV2 | null> {
+export async function loadAccountRecord(env: AppEnv, userId: string): Promise<AccountRecord | null> {
   if (!userIdSchema.safeParse(userId).success) return null;
-  const key = `${VAULT_KEY_PREFIX}${userId}`;
+  const key = `${ACCOUNT_KEY_PREFIX}${userId}`;
   const value = await env.OAUTH_KV.get(key);
-  if (!value) return null;
-  const decrypted = await decryptRecord(value, key, getCredentialsEncryptionSecret(env));
-  return validateVault(vaultSchema.parse(decrypted));
+  return value ? recordSchema.parse(await decryptRecord(value, key, getCredentialsEncryptionSecret(env))) : null;
 }
 
 export async function saveAccountDraft(env: AppEnv, state: string, draft: AccountDraft): Promise<void> {
-  const parsed = draftSchema.parse(draft);
   const key = `${DRAFT_KEY_PREFIX}${state}`;
-  const encrypted = await encryptRecord(parsed, key, getCredentialsEncryptionSecret(env));
+  const encrypted = await encryptRecord(draftSchema.parse(draft), key, getCredentialsEncryptionSecret(env));
   await env.OAUTH_KV.put(key, encrypted, { expirationTtl: ACCOUNT_DRAFT_TTL_SECONDS });
 }
 
 export async function loadAccountDraft(env: AppEnv, state: string): Promise<AccountDraft | null> {
   const key = `${DRAFT_KEY_PREFIX}${state}`;
   const value = await env.OAUTH_KV.get(key);
-  if (!value) return null;
-  return draftSchema.parse(await decryptRecord(value, key, getCredentialsEncryptionSecret(env)));
+  return value ? draftSchema.parse(await decryptRecord(value, key, getCredentialsEncryptionSecret(env))) : null;
 }
 
 export async function deleteAccountDraft(env: AppEnv, state: string): Promise<void> {
   await env.OAUTH_KV.delete(`${DRAFT_KEY_PREFIX}${state}`);
 }
 
-function draftFromVault(vault: AccountVaultV2): AccountDraft {
-  return {
-    userId: vault.userId,
-    baseRevision: vault.revision,
-    defaultAccountId: vault.defaultAccountId,
-    accounts: vault.accounts,
-  };
+function draftFromRecord(record: AccountRecord): AccountDraft {
+  return { userId: record.userId, baseRevision: record.revision, account: record.account };
 }
 
-async function loadDraftForOwner(env: AppEnv, owner: string): Promise<AccountDraft> {
-  const vault = await loadAccountVault(env, owner);
-  if (!vault) throw new AccountVaultError("The account profile could not be unlocked");
-  return draftFromVault(vault);
-}
-
-async function loadLegacyAccountDraftByEmail(env: AppEnv, email: string, secret: string): Promise<AccountDraft | null> {
-  const legacyId = await credentialIdForEmail(email, secret);
+// Read old vaults only during sign-in. Never authorize a legacy grant or copy sibling accounts.
+async function savedAccountByEmail(env: AppEnv, email: string): Promise<StoredMailAccount | null> {
+  const secret = getCredentialsEncryptionSecret(env);
+  const owner = await env.OAUTH_KV.get(await emailIndexKey(email, secret))
+    ?? await env.OAUTH_KV.get(await locatorIndexKey(`icloud\u0000${email}`, secret));
+  if (owner) {
+    const key = `${VAULT_KEY_PREFIX}${owner}`;
+    const value = await env.OAUTH_KV.get(key);
+    if (value) {
+      const legacy = z.object({ accounts: z.array(storedAccountSchema).min(1).max(10) }).parse(await decryptRecord(value, key, secret));
+      return legacy.accounts.find((account) => normalizeAddress(account.address) === email) ?? null;
+    }
+  }
   try {
-    const credentials = await loadMailCredentials(env, legacyId);
-    const account = storedAccountSchema.parse({
+    const credentials = await loadMailCredentials(env, await credentialIdForEmail(email, secret));
+    return storedAccountSchema.parse({
       accountId: randomId("acct_"),
       label: "iCloud",
       preset: "icloud",
-      address: normalizeAddress(credentials.email),
+      address: email,
       capabilities: { mail: true, calendar: true, contacts: true },
       config: getMailConfig(env, credentials),
     });
-    return {
-      userId: legacyId,
-      baseRevision: null,
-      defaultAccountId: account.accountId,
-      accounts: [account],
-    };
   } catch (error) {
     if (!(error instanceof MailCredentialError)) throw error;
     return null;
   }
 }
 
+async function newIndexKey(email: string, secret: string): Promise<string> {
+  return `mail:account-email-index:v3:${await indexDigest(normalizeAddress(email), EMAIL_INDEX_CONTEXT, secret)}`;
+}
+
 export async function findAccountDraftByEmail(env: AppEnv, email: string): Promise<AccountDraft | null> {
-  const parsedEmail = z.string().trim().email().max(320).safeParse(email);
-  if (!parsedEmail.success) return null;
-  const normalizedEmail = normalizeAddress(parsedEmail.data);
-  const secret = getCredentialsEncryptionSecret(env);
-
-  const owner = await env.OAUTH_KV.get(await emailIndexKey(normalizedEmail, secret));
-  if (owner) return loadDraftForOwner(env, owner);
-
-  // Older v2 iCloud accounts only have the locator index, which is also email-based.
-  const legacyLocatorOwner = await env.OAUTH_KV.get(
-    await locatorIndexKey(`icloud\u0000${normalizedEmail}`, secret),
-  );
-  if (legacyLocatorOwner) return loadDraftForOwner(env, legacyLocatorOwner);
-
-  // Before account vaults existed, iCloud credentials were keyed by a digest of the email.
-  return loadLegacyAccountDraftByEmail(env, normalizedEmail, secret);
-}
-
-export async function commitAccountDraft(env: AppEnv, draft: AccountDraft): Promise<AccountVaultV2> {
-  return withSpan("mail.accounts.commit", { "mail.accounts.count": draft.accounts.length }, async () => {
-    const parsed = draftSchema.parse(draft);
-    const existing = await loadAccountVault(env, parsed.userId);
-    if (parsed.baseRevision === null ? existing !== null : existing?.revision !== parsed.baseRevision) {
-      throw new AccountVaultError("Account configuration changed in another reconnect; restart reconnecting");
-    }
-    const vault = validateVault({
-      version: 2,
-      userId: parsed.userId,
-      revision: (existing?.revision ?? 0) + 1,
-      defaultAccountId: parsed.defaultAccountId,
-      accounts: parsed.accounts,
-    });
-    const secret = getCredentialsEncryptionSecret(env);
-    const nextLocatorKeys = await Promise.all(vault.accounts.map((account) => indexKey(account, secret)));
-    const nextEmailKeys = [...new Set(await Promise.all(vault.accounts.map((account) => emailIndexKey(account.address, secret))))];
-    const nextKeys = [...new Set([...nextLocatorKeys, ...nextEmailKeys])];
-    for (const key of nextKeys) {
-      const owner = await env.OAUTH_KV.get(key);
-      if (owner && owner !== vault.userId) throw new AccountVaultError("This upstream account is already attached to another profile");
-    }
-    const vaultKey = `${VAULT_KEY_PREFIX}${vault.userId}`;
-    await env.OAUTH_KV.put(vaultKey, await encryptRecord(vault, vaultKey, secret));
-    await Promise.all(nextKeys.map((key) => env.OAUTH_KV.put(key, vault.userId)));
-    if (existing) {
-      const oldLocatorKeys = await Promise.all(existing.accounts.map((account) => indexKey(account, secret)));
-      const oldEmailKeys = [...new Set(await Promise.all(existing.accounts.map((account) => emailIndexKey(account.address, secret))))];
-      const oldKeys = [...new Set([...oldLocatorKeys, ...oldEmailKeys])];
-      await Promise.all(oldKeys.filter((key) => !nextKeys.includes(key)).map((key) => env.OAUTH_KV.delete(key)));
-    }
-    return vault;
-  });
-}
-
-export async function findAccountDraft(env: AppEnv, verifiedAccount: StoredMailAccount): Promise<AccountDraft | null> {
-  const secret = getCredentialsEncryptionSecret(env);
-  const owner = await env.OAUTH_KV.get(await indexKey(verifiedAccount, secret));
+  const parsed = z.string().trim().email().max(320).safeParse(email);
+  if (!parsed.success) return null;
+  const address = normalizeAddress(parsed.data);
+  const owner = await env.OAUTH_KV.get(await newIndexKey(address, getCredentialsEncryptionSecret(env)));
   if (owner) {
-    return loadDraftForOwner(env, owner);
+    const record = await loadAccountRecord(env, owner);
+    if (!record) throw new AccountError("The saved account could not be opened");
+    return draftFromRecord(record);
   }
-  if (verifiedAccount.preset === "icloud") {
-    const legacyId = await credentialIdForEmail(verifiedAccount.address, secret);
-    try {
-      await loadMailCredentials(env, legacyId);
-      return {
-        userId: legacyId,
-        baseRevision: null,
-        defaultAccountId: verifiedAccount.accountId,
-        accounts: [verifiedAccount],
-      };
-    } catch (error) {
-      if (!(error instanceof MailCredentialError)) throw error;
-    }
-  }
-  return null;
+  const account = await savedAccountByEmail(env, address);
+  return account ? newAccountDraft(account) : null;
 }
 
-export async function unlockAccountDraft(env: AppEnv, verifiedAccount: StoredMailAccount): Promise<AccountDraft> {
-  const draft = await findAccountDraft(env, verifiedAccount);
-  if (!draft) throw new AccountVaultError("The account profile could not be unlocked");
+export async function findAccountDraft(env: AppEnv, account: StoredMailAccount): Promise<AccountDraft | null> {
+  const draft = await findAccountDraftByEmail(env, account.address);
+  if (draft && canonicalLocator(draft.account) !== canonicalLocator(account)) {
+    throw new AccountError("This email address is already configured with another server");
+  }
   return draft;
 }
 
-export function accountSummary(account: StoredMailAccount, defaultAccountId: string): AccountSummary {
+export async function commitAccountDraft(env: AppEnv, draft: AccountDraft): Promise<AccountRecord> {
+  const parsed = draftSchema.parse(draft);
+  const existing = await loadAccountRecord(env, parsed.userId);
+  if (parsed.baseRevision === null ? existing !== null : existing?.revision !== parsed.baseRevision) {
+    throw new AccountError("Account configuration changed in another reconnect; restart reconnecting");
+  }
+  const secret = getCredentialsEncryptionSecret(env);
+  const index = await newIndexKey(parsed.account.address, secret);
+  const owner = await env.OAUTH_KV.get(index);
+  if (owner && owner !== parsed.userId) throw new AccountError("This account is already configured; reconnect it");
+  const record = recordSchema.parse({
+    version: 3,
+    userId: parsed.userId,
+    revision: (existing?.revision ?? 0) + 1,
+    account: parsed.account,
+  });
+  const key = `${ACCOUNT_KEY_PREFIX}${record.userId}`;
+  await env.OAUTH_KV.put(key, await encryptRecord(record, key, secret));
+  await env.OAUTH_KV.put(index, record.userId);
+  return record;
+}
+
+export function accountSummary(account: StoredMailAccount): AccountSummary {
   return {
     accountId: account.accountId,
     label: account.label,
     address: account.address,
     preset: account.preset,
     capabilities: account.capabilities,
-    isDefault: account.accountId === defaultAccountId,
   };
 }
 
-export async function listAccountsForUser(env: AppEnv, props: AuthProps): Promise<{ accounts: AccountSummary[]; defaultAccountId: string }> {
-  const vault = await loadAccountVault(env, props.userId);
-  if (vault) return {
-    accounts: vault.accounts.map((account) => accountSummary(account, vault.defaultAccountId)),
-    defaultAccountId: vault.defaultAccountId,
-  };
-  if (!props.credentialId) throw new AccountVaultError("Accounts are not configured; reconnect the MCP server");
-  const credentials = await loadMailCredentials(env, props.credentialId);
-  const accountId = props.credentialId;
-  return {
-    accounts: [{
-      accountId,
-      label: "iCloud",
-      address: credentials.email,
-      preset: "icloud",
-      capabilities: { mail: true, calendar: true, contacts: true },
-      isDefault: true,
-    }],
-    defaultAccountId: accountId,
-  };
-}
-
-export async function resolveAccount(
-  env: AppEnv,
-  props: AuthProps,
-  accountId?: string,
-  capability?: AccountCapability,
-): Promise<{ account: StoredMailAccount; summary: AccountSummary }> {
-  return withSpan("mail.accounts.resolve", { "mail.accounts.capability": capability }, async (span) => {
-    const vault = await loadAccountVault(env, props.userId);
-    if (vault) {
-      const selectedId = accountId ?? vault.defaultAccountId;
-      const account = vault.accounts.find((candidate) => candidate.accountId === selectedId);
-      if (!account) throw new AccountVaultError("Unknown accountId");
-      if (capability && !account.capabilities[capability]) throw new AccountVaultError(`The selected account does not support ${capability}`);
-      span.setAttribute("mail.accounts.preset", account.preset);
-      span.setAttribute("mail.accounts.count", vault.accounts.length);
-      span.setAttribute("mail.accounts.imap_tls", account.config.imapTlsMode);
-      span.setAttribute("mail.accounts.smtp_tls", account.config.smtpTlsMode);
-      return { account, summary: accountSummary(account, vault.defaultAccountId) };
-    }
-    if (!props.credentialId || (accountId && accountId !== props.credentialId)) throw new AccountVaultError("Unknown accountId");
-    const credentials = await loadMailCredentials(env, props.credentialId);
-    const account: StoredMailAccount = {
-      accountId: props.credentialId,
-      label: "iCloud",
-      preset: "icloud",
-      address: credentials.email,
-      capabilities: { mail: true, calendar: true, contacts: true },
-      config: getMailConfig(env, credentials),
-    };
-    span.setAttribute("mail.accounts.preset", "icloud");
-    span.setAttribute("mail.accounts.imap_tls", "implicit");
-    span.setAttribute("mail.accounts.smtp_tls", "starttls");
-    return { account, summary: accountSummary(account, account.accountId) };
-  });
-}
-
-export function addDraftAccount(draft: AccountDraft, account: StoredMailAccount): AccountDraft {
-  if (draft.accounts.length >= MAX_ACCOUNTS) throw new AccountVaultError(`A profile can contain at most ${MAX_ACCOUNTS} accounts`);
-  return draftSchema.parse({ ...draft, accounts: [...draft.accounts, account] });
-}
-
-export function replaceDraftAccount(draft: AccountDraft, account: StoredMailAccount): AccountDraft {
-  if (!draft.accounts.some((candidate) => candidate.accountId === account.accountId)) throw new AccountVaultError("Unknown accountId");
-  return draftSchema.parse({ ...draft, accounts: draft.accounts.map((candidate) => candidate.accountId === account.accountId ? account : candidate) });
-}
-
-export function removeDraftAccount(draft: AccountDraft, accountId: string): AccountDraft {
-  if (draft.accounts.length === 1) throw new AccountVaultError("The final account cannot be removed");
-  const accounts = draft.accounts.filter((account) => account.accountId !== accountId);
-  if (accounts.length === draft.accounts.length) throw new AccountVaultError("Unknown accountId");
-  return draftSchema.parse({
-    ...draft,
-    accounts,
-    defaultAccountId: draft.defaultAccountId === accountId ? accounts[0].accountId : draft.defaultAccountId,
-  });
-}
-
-export function setDraftDefault(draft: AccountDraft, accountId: string): AccountDraft {
-  if (!draft.accounts.some((account) => account.accountId === accountId)) throw new AccountVaultError("Unknown accountId");
-  return draftSchema.parse({ ...draft, defaultAccountId: accountId });
+export async function resolveAccount(env: AppEnv, props: AuthProps, capability?: AccountCapability): Promise<{ account: StoredMailAccount; summary: AccountSummary }> {
+  if (props.accountVersion !== 3) throw new AccountError("Reconnect the MCP server and authorize each account separately");
+  const record = await loadAccountRecord(env, props.userId);
+  if (!record) throw new AccountError("Account is not configured; reconnect the MCP server");
+  if (capability && !record.account.capabilities[capability]) throw new AccountError(`The connected account does not support ${capability}`);
+  return { account: record.account, summary: accountSummary(record.account) };
 }
