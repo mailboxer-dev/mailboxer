@@ -1,4 +1,4 @@
-import { AccountVaultError } from "./accounts";
+import { AccountError } from "./accounts";
 import { MailCredentialError } from "./credentials";
 import { DavPayloadTooLargeError, DavProtocolError } from "./dav/client";
 import { DavCursorError } from "./dav/cursor";
@@ -22,7 +22,7 @@ export function publicError(error: unknown): string {
   if (error instanceof ImapProtocolError || error instanceof SmtpProtocolError || error instanceof DavProtocolError) return error.message;
   if (error instanceof IcalendarParseError || error instanceof VcardParseError || error instanceof DavCursorError) return error.message;
   if (error instanceof MailCredentialError) return error.message;
-  if (error instanceof AccountVaultError) return error.message;
+  if (error instanceof AccountError) return error.message;
   if (error instanceof Error && error.message.startsWith("Missing Worker")) return "Account credentials are not configured";
   if (error instanceof Error && error.message.startsWith("Missing required scope:")) return error.message;
   if (error instanceof z.ZodError) return "Input failed validation";

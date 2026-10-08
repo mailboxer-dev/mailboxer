@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { listAccountsForUser, resolveAccount } from "./accounts";
+import { resolveAccount } from "./accounts";
 import { MessageTooLargeError, withImapConfig, type ImapClient } from "./imap/client";
 import { parseRfc822, decodeContentTransfer, encodeBase64 } from "./mime";
 import { SmtpClient } from "./smtp/client";
@@ -36,10 +36,6 @@ const searchShape = {
 const mailboxSchema = z.string().min(1).max(MAILBOX_LIMIT);
 const uidSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 const uidListSchema = z.array(uidSchema).min(1).max(MAX_UIDS_PER_MUTATION);
-const accountIdSchema = z.string()
-  .regex(/^acct_[A-Za-z0-9_-]{22}$|^icloud-[A-Za-z0-9_-]{43}$/u)
-  .describe("Configured account identifier returned by list_accounts; preserve it across related workflow calls.")
-  .optional();
 
 function safeUidList(values: number[]): number[] {
   return [...new Set(uidListSchema.parse(values))];
@@ -58,10 +54,9 @@ function safeFlags(flags: string[]): string[] {
 async function withUserImap<T>(
   env: AppEnv,
   props: MailAuthProps,
-  accountId: string | undefined,
   operation: (imap: ImapClient) => Promise<T>,
 ): Promise<{ value: T; account: AccountSummary }> {
-  const selected = await resolveAccount(env, props, accountId, "mail");
+  const selected = await resolveAccount(env, props, "mail");
   return { value: await withImapConfig(selected.account.config, operation), account: selected.summary };
 }
 
@@ -80,16 +75,16 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
   const server = new McpServer({ name: "email-mcp", version: "0.1.0" });
 
   server.registerTool(
-    "list_accounts",
+    "get_account",
     {
-      description: "List the configured email accounts and identify the default account. Credentials and server details are never returned.",
+      description: "Get the connected account and its available services. Credentials and server details are never returned.",
       inputSchema: {},
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async () => withToolSpan("list_accounts", async () => {
+    async () => withToolSpan("get_account", async () => {
       try {
         if (!props?.userId) throw new Error("Missing authenticated user");
-        return textResult(await listAccountsForUser(env, props));
+        return textResult((await resolveAccount(env, props)).summary);
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
@@ -100,13 +95,13 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     "list_mailboxes",
     {
       description: "List live IMAP mailboxes and their special-use roles for one configured account.",
-      inputSchema: { accountId: accountIdSchema, subscribedOnly: z.boolean().optional().default(false) },
+      inputSchema: { subscribedOnly: z.boolean().optional().default(false) },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ accountId, subscribedOnly }) => withToolSpan("list_mailboxes", async () => {
+    async ({ subscribedOnly }) => withToolSpan("list_mailboxes", async () => {
       try {
         requireScope(props, "mail.read");
-        const result = await withUserImap(env, props, accountId, (imap) => imap.listMailboxes(subscribedOnly));
+        const result = await withUserImap(env, props, (imap) => imap.listMailboxes(subscribedOnly));
         return textResult({ mailboxes: result.value, account: result.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
@@ -119,17 +114,16 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     {
       description: "List a bounded page of live messages from one account's IMAP mailbox using UID cursors.",
       inputSchema: {
-        accountId: accountIdSchema,
         mailbox: mailboxSchema.optional().default("INBOX"),
         beforeUid: uidSchema.optional(),
         limit: z.number().int().min(1).max(DEFAULT_PAGE_SIZE).optional().default(DEFAULT_PAGE_SIZE),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ accountId, mailbox, beforeUid, limit }) => withToolSpan("list_messages", async () => {
+    async ({ mailbox, beforeUid, limit }) => withToolSpan("list_messages", async () => {
       try {
         requireScope(props, "mail.read");
-        const result = await withUserImap(env, props, accountId, async (imap) => {
+        const result = await withUserImap(env, props, async (imap) => {
           const uids = await imap.search(mailbox, {});
           const selected = pageUids(uids, beforeUid, limit);
           const messages: MessageMetadata[] = [];
@@ -144,7 +138,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }, { accountId, mailbox }),
+    }, { mailbox }),
   );
 
   server.registerTool(
@@ -152,7 +146,6 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     {
       description: "Search one account's live IMAP messages with structured sender, recipient, subject, text, date, and flag filters.",
       inputSchema: {
-        accountId: accountIdSchema,
         mailbox: mailboxSchema.optional().default("INBOX"),
         beforeUid: uidSchema.optional(),
         limit: z.number().int().min(1).max(DEFAULT_PAGE_SIZE).optional().default(DEFAULT_PAGE_SIZE),
@@ -160,10 +153,10 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ accountId, mailbox, beforeUid, limit, ...filters }) => withToolSpan("search_messages", async () => {
+    async ({ mailbox, beforeUid, limit, ...filters }) => withToolSpan("search_messages", async () => {
       try {
         requireScope(props, "mail.read");
-        const result = await withUserImap(env, props, accountId, async (imap) => {
+        const result = await withUserImap(env, props, async (imap) => {
           const uids = await imap.search(mailbox, filters);
           const selected = pageUids(uids, beforeUid, limit);
           const messages: MessageMetadata[] = [];
@@ -179,7 +172,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }, { accountId, mailbox }),
+    }, { mailbox }),
   );
 
   server.registerTool(
@@ -187,16 +180,15 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     {
       description: "Fetch one live IMAP message by UID, parse its RFC822 content, and return bounded structured MIME data. The result includes metadata.attachments[] with authoritative IMAP BODYSTRUCTURE part identifiers; pass metadata.attachments[].part unchanged to get_attachment when a separate attachment fetch is needed. Parsed attachments may already include bounded base64 bodies.",
       inputSchema: {
-        accountId: accountIdSchema,
         mailbox: mailboxSchema.optional().default("INBOX"),
         uid: uidSchema,
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ accountId, mailbox, uid }) => withToolSpan("get_message", async () => {
+    async ({ mailbox, uid }) => withToolSpan("get_message", async () => {
       try {
         requireScope(props, "mail.read");
-        const result = await withUserImap(env, props, accountId, async (imap) => {
+        const result = await withUserImap(env, props, async (imap) => {
           const metadata = await imap.fetchMetadata(mailbox, uid);
           const raw = await imap.fetchRaw(mailbox, uid, metadata.size);
           return parseRfc822(raw, metadata, metadata.attachments);
@@ -205,15 +197,14 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }, { accountId, mailbox, uid }),
+    }, { mailbox, uid }),
   );
 
   server.registerTool(
     "get_attachment",
     {
-      description: "Fetch one bounded attachment body from a live IMAP message by UID and BODY part number. Call this after get_message with the same accountId, mailbox, and uid, using the exact metadata.attachments[].part value returned by get_message; do not guess or renumber the IMAP part.",
+      description: "Fetch one bounded attachment body from a live IMAP message by UID and BODY part number. Call this after get_message with the same connection, mailbox, and uid, using the exact metadata.attachments[].part value returned by get_message; do not guess or renumber the IMAP part.",
       inputSchema: {
-        accountId: accountIdSchema,
         mailbox: mailboxSchema.optional().default("INBOX"),
         uid: uidSchema,
         part: z.string()
@@ -222,10 +213,10 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ accountId, mailbox, uid, part }) => withToolSpan("get_attachment", async () => {
+    async ({ mailbox, uid, part }) => withToolSpan("get_attachment", async () => {
       try {
         requireScope(props, "mail.read");
-        const result = await withUserImap(env, props, accountId, async (imap) => {
+        const result = await withUserImap(env, props, async (imap) => {
           const metadata = await imap.fetchMetadata(mailbox, uid);
           const descriptor = metadata.attachments.find((candidate) => candidate.part === part);
           if (!descriptor) throw new Error("Attachment part was not found in BODYSTRUCTURE");
@@ -245,7 +236,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
       }
-    }, { accountId, mailbox, uid, part }),
+    }, { mailbox, uid, part }),
   );
 
   server.registerTool(
@@ -253,7 +244,6 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     {
       description: "Add or remove bounded IMAP flags on live messages by UID.",
       inputSchema: {
-        accountId: accountIdSchema,
         mailbox: mailboxSchema.optional().default("INBOX"),
         uids: uidListSchema,
         add: z.array(z.string().max(64)).max(20).optional().default([]),
@@ -261,14 +251,14 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ accountId, mailbox, uids, add, remove }) => withToolSpan("set_message_flags", async () => {
+    async ({ mailbox, uids, add, remove }) => withToolSpan("set_message_flags", async () => {
       try {
         requireScope(props, "mail.write");
         const normalizedAdd = safeFlags(add);
         const normalizedRemove = safeFlags(remove);
         if (!normalizedAdd.length && !normalizedRemove.length) throw new Error("At least one flag change is required");
         const normalizedUids = safeUidList(uids);
-        const result = await withUserImap(env, props, accountId, (imap) => imap.setFlags(mailbox, normalizedUids, normalizedAdd, normalizedRemove));
+        const result = await withUserImap(env, props, (imap) => imap.setFlags(mailbox, normalizedUids, normalizedAdd, normalizedRemove));
         return textResult({ mailbox, uids: normalizedUids, added: normalizedAdd, removed: normalizedRemove, account: result.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
@@ -281,18 +271,17 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     {
       description: "Move live messages within one account by UID using MOVE or a UIDPLUS-safe fallback.",
       inputSchema: {
-        accountId: accountIdSchema,
         sourceMailbox: mailboxSchema.optional().default("INBOX"),
         destinationMailbox: mailboxSchema,
         uids: uidListSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ accountId, sourceMailbox, destinationMailbox, uids }) => withToolSpan("move_messages", async () => {
+    async ({ sourceMailbox, destinationMailbox, uids }) => withToolSpan("move_messages", async () => {
       try {
         requireScope(props, "mail.write");
         const normalizedUids = safeUidList(uids);
-        const result = await withUserImap(env, props, accountId, (imap) => imap.moveMessages(sourceMailbox, destinationMailbox, normalizedUids));
+        const result = await withUserImap(env, props, (imap) => imap.moveMessages(sourceMailbox, destinationMailbox, normalizedUids));
         return textResult({ sourceMailbox, destinationMailbox, uids: normalizedUids, moved: true, account: result.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
@@ -305,18 +294,17 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     {
       description: "Move live messages to the IMAP \\Trash mailbox by default; permanent deletion requires explicit confirmation and UIDPLUS.",
       inputSchema: {
-        accountId: accountIdSchema,
         mailbox: mailboxSchema.optional().default("INBOX"),
         uids: uidListSchema,
         permanent: z.boolean().optional().default(false),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ accountId, mailbox, uids, permanent }) => withToolSpan("delete_messages", async () => {
+    async ({ mailbox, uids, permanent }) => withToolSpan("delete_messages", async () => {
       try {
         requireScope(props, "mail.write");
         const normalizedUids = safeUidList(uids);
-        const result = await withUserImap(env, props, accountId, (imap) => imap.deleteMessages(mailbox, normalizedUids, permanent));
+        const result = await withUserImap(env, props, (imap) => imap.deleteMessages(mailbox, normalizedUids, permanent));
         return textResult({ mailbox, uids: normalizedUids, permanent, destination: result.value, account: result.account });
       } catch (error) {
         return textResult({ error: publicError(error) }, true);
@@ -329,7 +317,6 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
     {
       description: "Compose and deliver a bounded email through one account's SMTP server, then append the exact RFC822 bytes to its Sent mailbox.",
       inputSchema: {
-        accountId: accountIdSchema,
         to: z.array(z.string().max(320)).min(1).max(50),
         cc: z.array(z.string().max(320)).max(50).optional().default([]),
         bcc: z.array(z.string().max(320)).max(50).optional().default([]),
@@ -346,11 +333,11 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    async ({ accountId, to, cc, bcc, replyTo, subject, text, html, attachments }) => withToolSpan("send_email", async () => {
+    async ({ to, cc, bcc, replyTo, subject, text, html, attachments }) => withToolSpan("send_email", async () => {
       try {
         requireScope(props, "mail.write");
         if (text === undefined && html === undefined) throw new Error("At least one of text or html is required");
-        const selected = await resolveAccount(env, props, accountId, "mail");
+        const selected = await resolveAccount(env, props, "mail");
         const config = selected.account.config;
         const composed = await SmtpClient.sendWithConfig(config, {
           from: config.email,
@@ -387,7 +374,7 @@ export function createMailServer(env: AppEnv, props: MailAuthProps): McpServer {
 }
 
 export const TOOL_NAMES = [
-  "list_accounts",
+  "get_account",
   "list_mailboxes",
   "list_messages",
   "search_messages",

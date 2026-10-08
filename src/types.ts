@@ -14,7 +14,9 @@ export type ResourceScope = (typeof RESOURCE_SCOPES)[number];
 
 export interface AuthProps {
   userId: string;
-  /** Present on grants created before multi-account vaults were introduced. */
+  /** Version 3 grants authorize one stored account. */
+  accountVersion?: 3;
+  /** Present only on legacy grants, which now require reconnecting. */
   credentialId?: string;
   scopes: string[];
 }
@@ -26,7 +28,8 @@ export function restrictPropsToTokenScope(props: unknown, scopes: string[]): Aut
   const userId = typeof record.userId === "string" ? record.userId : "";
   const credentialId = typeof record.credentialId === "string" ? record.credentialId : undefined;
   const resourceScopes = scopes.filter((scope) => (RESOURCE_SCOPES as readonly string[]).includes(scope));
-  return { userId, ...(credentialId ? { credentialId } : {}), scopes: resourceScopes };
+  const accountVersion = record.accountVersion === 3 ? 3 as const : undefined;
+  return { userId, ...(accountVersion ? { accountVersion } : {}), ...(credentialId ? { credentialId } : {}), scopes: resourceScopes };
 }
 
 export const restrictMailPropsToTokenScope = restrictPropsToTokenScope;
@@ -67,7 +70,6 @@ export interface AccountSummary {
   address: string;
   preset: AccountPreset;
   capabilities: AccountCapabilities;
-  isDefault: boolean;
 }
 
 export interface StoredMailAccount {
@@ -80,12 +82,11 @@ export interface StoredMailAccount {
   davConfig?: DavConfig;
 }
 
-export interface AccountVaultV2 {
-  version: 2;
+export interface AccountRecord {
+  version: 3;
   userId: string;
   revision: number;
-  defaultAccountId: string;
-  accounts: StoredMailAccount[];
+  account: StoredMailAccount;
 }
 
 export interface DavConfig {
