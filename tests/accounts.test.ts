@@ -1,18 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  AccountVaultError,
-  addDraftAccount,
   commitAccountDraft,
   findAccountDraft,
   findAccountDraftByEmail,
   loadAccountDraft,
-  loadAccountVault,
   newAccountDraft,
-  removeDraftAccount,
   resolveAccount,
   saveAccountDraft,
-  setDraftDefault,
-  unlockAccountDraft,
   verifyAccountSubmission,
 } from "../src/accounts";
 import { storeMailCredentials } from "../src/credentials";
@@ -66,104 +60,76 @@ function account(seed: string, capabilities = { mail: true, calendar: false, con
   };
 }
 
-describe("multi-account vault", () => {
+// Reproduce the persisted v2 format, independently of the new account writer.
+async function seedLegacyVault(environment: AppEnv, kv: MemoryKv, accounts: StoredMailAccount[]): Promise<string> {
+  const encoder = new TextEncoder();
+  const userId = `usr_${"x".repeat(32)}`;
+  const keyName = `mail:account-vault:v2:${userId}`;
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(`email-mcp account vault v2\u0000${environment.MAIL_CREDENTIALS_ENCRYPTION_KEY}`));
+  const key = await crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: encoder.encode(keyName) }, key,
+    encoder.encode(JSON.stringify({ version: 2, userId, revision: 1, defaultAccountId: accounts[0].accountId, accounts })));
+  const encode = (value: ArrayBuffer | Uint8Array) => btoa(String.fromCharCode(...new Uint8Array(value))).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/gu, "");
+  await kv.put(keyName, JSON.stringify({ version: 2, iv: encode(iv), ciphertext: encode(ciphertext) }));
+  const hmac = await crypto.subtle.importKey("raw", encoder.encode(environment.MAIL_CREDENTIALS_ENCRYPTION_KEY), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  for (const account of accounts) {
+    const signature = await crypto.subtle.sign("HMAC", hmac, encoder.encode(`email-mcp account email index v2\u0000${account.address.toLowerCase()}`));
+    await kv.put(`mail:account-email-index:v2:${encode(signature)}`, userId);
+  }
+  return userId;
+}
+
+describe("single-account storage", () => {
   it("returns no draft for a verified account that is not attached yet", async () => {
     await expect(findAccountDraft(env(), account("new"))).resolves.toBeNull();
   });
 
-  it("finds a committed draft by normalized email before credentials are supplied", async () => {
-    const environment = env();
-    const vault = await commitAccountDraft(environment, newAccountDraft(account("saved")));
-
-    await expect(findAccountDraftByEmail(environment, "  SAVED@EXAMPLE.COM  ")).resolves.toMatchObject({
-      userId: vault.userId,
-      baseRevision: vault.revision,
-      defaultAccountId: vault.defaultAccountId,
-    });
-  });
-
-  it("encrypts drafts and vaults, routes by default or explicit account, and returns safe summaries", async () => {
+  it("encrypts one account, resolves only version 3 grants, and hides credentials", async () => {
     const kv = new MemoryKv();
     const environment = env(kv);
-    let draft = newAccountDraft(account("one"));
-    const second = account("two");
-    draft = setDraftDefault(addDraftAccount(draft, second), second.accountId);
-
-    await saveAccountDraft(environment, "oauth-state", draft);
-    expect([...kv.values.values()].join("\n")).not.toContain("imap-password");
-    expect((await loadAccountDraft(environment, "oauth-state"))?.accounts).toHaveLength(2);
-
-    const vault = await commitAccountDraft(environment, draft);
-    const props = { userId: vault.userId, scopes: ["mail.read"] };
-    const selectedDefault = await resolveAccount(environment, props, undefined, "mail");
-    expect(selectedDefault.account.accountId).toBe(second.accountId);
-    expect(selectedDefault.summary).toMatchObject({ label: "Account two", isDefault: true });
-
-    const selectedFirst = await resolveAccount(environment, props, draft.accounts[0].accountId, "mail");
-    expect(selectedFirst.summary).toMatchObject({ address: "one@example.com", isDefault: false });
-    expect(JSON.stringify(selectedFirst.summary)).not.toContain("password");
-    expect([...kv.values.values()].join("\n")).not.toContain("smtp-password");
+    const draft = newAccountDraft(account("one"));
+    await saveAccountDraft(environment, "state", draft);
+    expect(await loadAccountDraft(environment, "state")).toEqual(draft);
+    const record = await commitAccountDraft(environment, draft);
+    expect((await findAccountDraftByEmail(environment, " ONE@EXAMPLE.COM "))?.userId).toBe(record.userId);
+    const selected = await resolveAccount(environment, { userId: record.userId, accountVersion: 3, scopes: [] }, "mail");
+    expect(selected.account.accountId).toBe(draft.account.accountId);
+    expect(JSON.stringify(selected.summary)).not.toContain("password");
+    expect([...kv.values.values()].join(" ")).not.toContain(draft.account.config.password);
+    await expect(resolveAccount(environment, { userId: record.userId, scopes: [] })).rejects.toThrow("Reconnect");
+    await expect(resolveAccount(environment, { userId: record.userId, accountVersion: 3, scopes: [] }, "calendar")).rejects.toThrow("does not support calendar");
+    await expect(commitAccountDraft(environment, draft)).rejects.toThrow("changed");
   });
 
-  it("enforces revision conflicts, unique upstream accounts, and final-account removal", async () => {
+  it("keeps different accounts in separate records", async () => {
     const environment = env();
-    const firstDraft = newAccountDraft(account("same"));
-    const firstVault = await commitAccountDraft(environment, firstDraft);
-    await expect(commitAccountDraft(environment, firstDraft)).rejects.toThrow(/changed in another reconnect/u);
-
-    const duplicateDraft = newAccountDraft({ ...account("other"), config: firstDraft.accounts[0].config });
-    await expect(commitAccountDraft(environment, duplicateDraft)).rejects.toThrow(/already attached/u);
-    expect(() => removeDraftAccount({
-      userId: firstVault.userId,
-      baseRevision: firstVault.revision,
-      defaultAccountId: firstVault.defaultAccountId,
-      accounts: firstVault.accounts,
-    }, firstVault.defaultAccountId)).toThrow(/final account/u);
+    const first = await commitAccountDraft(environment, newAccountDraft(account("one")));
+    const second = await commitAccountDraft(environment, newAccountDraft(account("two")));
+    expect(first.userId).not.toBe(second.userId);
+    const selected = await resolveAccount(environment, { userId: first.userId, accountVersion: 3, scopes: [] });
+    expect(selected.account.address).toBe(first.account.address);
+    await expect(commitAccountDraft(environment, newAccountDraft(first.account))).rejects.toThrow("already configured");
   });
 
-  it("rejects email ownership conflicts and removes email indexes for deleted accounts", async () => {
+  it("reconnects v2 sibling accounts into independent records and rejects the old grant", async () => {
     const kv = new MemoryKv();
     const environment = env(kv);
-    const removed = account("removed");
-    const retained = account("retained");
-    const initialDraft = addDraftAccount(newAccountDraft(removed), retained);
-    const firstVault = await commitAccountDraft(environment, initialDraft);
-    expect([...kv.values.keys()].filter((key) => key.startsWith("mail:account-email-index:v2:")).length).toBe(2);
-
-    const remainingDraft = removeDraftAccount({
-      userId: firstVault.userId,
-      baseRevision: firstVault.revision,
-      defaultAccountId: firstVault.defaultAccountId,
-      accounts: firstVault.accounts,
-    }, removed.accountId);
-    await commitAccountDraft(environment, remainingDraft);
-
-    await expect(findAccountDraftByEmail(environment, removed.address)).resolves.toBeNull();
-    await expect(findAccountDraftByEmail(environment, retained.address)).resolves.toMatchObject({ userId: firstVault.userId });
-    expect([...kv.values.keys()].filter((key) => key.startsWith("mail:account-email-index:v2:")).length).toBe(1);
-
-    const duplicate = {
-      ...account("duplicate"),
-      address: retained.address,
-      config: { ...account("duplicate").config, email: retained.address },
-    };
-    await expect(commitAccountDraft(environment, newAccountDraft(duplicate))).rejects.toThrow(/already attached/u);
-
-    const sameAddress = {
-      ...account("same-address"),
-      address: retained.address,
-      config: { ...account("same-address").config, email: retained.address },
-    };
-    await expect(commitAccountDraft(environment, addDraftAccount(newAccountDraft(retained), sameAddress)))
-      .rejects.toThrow(/invalid account list/u);
-  });
-
-  it("rejects unknown accounts and unavailable capabilities without exposing configuration", async () => {
-    const environment = env();
-    const vault = await commitAccountDraft(environment, newAccountDraft(account("mailonly")));
-    const props = { userId: vault.userId, scopes: ["mail.read", "calendar.read"] };
-    await expect(resolveAccount(environment, props, "acct_aaaaaaaaaaaaaaaaaaaaaa", "mail")).rejects.toThrow("Unknown accountId");
-    await expect(resolveAccount(environment, props, vault.defaultAccountId, "calendar")).rejects.toThrow(/does not support calendar/u);
+    const first = account("personal");
+    const second = account("work");
+    const oldUserId = await seedLegacyVault(environment, kv, [first, second]);
+    await expect(resolveAccount(environment, { userId: oldUserId, scopes: [] })).rejects.toThrow("Reconnect");
+    const firstDraft = await findAccountDraftByEmail(environment, first.address);
+    expect(firstDraft?.account).toEqual(first);
+    const firstRecord = await commitAccountDraft(environment, firstDraft!);
+    const secondDraft = await findAccountDraftByEmail(environment, second.address);
+    const secondRecord = await commitAccountDraft(environment, secondDraft!);
+    expect(firstRecord.userId).not.toBe(secondRecord.userId);
+    expect(firstRecord.userId).not.toBe(oldUserId);
+    expect(secondRecord.account).toEqual(second);
+    expect(await resolveAccount(environment, { userId: firstRecord.userId, accountVersion: 3, scopes: [] })).toMatchObject({ account: first });
+    expect(kv.values.has(`mail:account-vault:v2:${oldUserId}`)).toBe(true);
+    expect(JSON.stringify(firstRecord)).not.toContain(second.address);
   });
 
   it("validates custom host and TLS combinations before opening a socket", async () => {
@@ -256,54 +222,15 @@ describe("multi-account vault", () => {
     expect(davVerify).toHaveBeenCalledTimes(2);
   });
 
-  it("loads committed encrypted vaults", async () => {
+  it("loads a legacy iCloud account for reconnect without authorizing its old grant", async () => {
     const environment = env();
-    const vault = await commitAccountDraft(environment, newAccountDraft(account("stored")));
-    expect(await loadAccountVault(environment, vault.userId)).toEqual(vault);
-    await expect(loadAccountVault(environment, "not-a-user")).resolves.toBeNull();
-    expect(AccountVaultError).toBeDefined();
+    const credentialId = await storeMailCredentials(environment, { email: "legacy@icloud.com", imapUser: "legacy", appPassword: "legacy-password" });
+    const draft = await findAccountDraftByEmail(environment, " LEGACY@ICLOUD.COM ");
+    expect(draft?.account.address).toBe("legacy@icloud.com");
+    expect(draft?.userId).not.toBe(credentialId);
+    await expect(resolveAccount(environment, { userId: credentialId, credentialId, scopes: [] })).rejects.toThrow("Reconnect");
   });
-
-  it("lazily migrates a legacy iCloud record while retaining its user identity", async () => {
-    const environment = env();
-    const legacyId = await storeMailCredentials(environment, {
-      email: "legacy@icloud.com",
-      imapUser: "legacy",
-      appPassword: "app-password",
-    });
-    const verified: StoredMailAccount = {
-      ...account("legacy", { mail: true, calendar: true, contacts: true }),
-      preset: "icloud",
-      address: "legacy@icloud.com",
-      config: {
-        ...account("legacy").config,
-        email: "legacy@icloud.com",
-        imapHost: "imap.mail.me.com",
-        smtpHost: "smtp.mail.me.com",
-      },
-    };
-    const draft = await unlockAccountDraft(environment, verified);
-    expect(draft.userId).toBe(legacyId);
-    const migrated = await commitAccountDraft(environment, draft);
-    expect(migrated.userId).toBe(legacyId);
-    expect(await loadAccountVault(environment, legacyId)).toEqual(migrated);
-  });
-
-  it("finds a legacy iCloud record by normalized email", async () => {
-    const environment = env();
-    const legacyId = await storeMailCredentials(environment, {
-      email: "legacy@icloud.com",
-      imapUser: "legacy",
-      appPassword: "app-password",
-    });
-
-    await expect(findAccountDraftByEmail(environment, " LEGACY@ICLOUD.COM ")).resolves.toMatchObject({
-      userId: legacyId,
-      baseRevision: null,
-    });
-  });
-
   it("returns no draft for an unknown email", async () => {
-    await expect(findAccountDraftByEmail(env(), "unknown@example.com")).resolves.toBeNull();
+    expect(await findAccountDraftByEmail(env(), "unknown@icloud.com")).toBeNull();
   });
 });

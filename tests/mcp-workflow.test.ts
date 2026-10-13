@@ -1,14 +1,13 @@
 import { createMcpHandler } from "agents/mcp/server";
 import { describe, expect, it, vi } from "vitest";
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
-import { addDraftAccount, commitAccountDraft, newAccountDraft, setDraftDefault } from "../src/accounts";
+import { commitAccountDraft, newAccountDraft } from "../src/accounts";
 import { ImapClient } from "../src/imap/client";
 import { createMailServer } from "../src/mail-server";
 import { encodeBase64 } from "../src/mime";
 import type { AppEnv, MailAuthProps, MessageMetadata, StoredMailAccount } from "../src/types";
 
 const accountId = "acct_wMp16sTzQ7Tq9TPZN3doYw";
-const fallbackAccountId = "acct_fallback_account_12345";
 const mailbox = "INBOX";
 const uid = 61514;
 const attachmentPart = "2";
@@ -258,10 +257,10 @@ describe("MCP email-to-calendar workflow regression", () => {
     const fromConfig = vi.spyOn(ImapClient, "fromConfig").mockResolvedValue(imap as unknown as ImapClient);
 
     const target = account(accountId, "iCloud", "owner@icloud.com", { mail: true, calendar: true, contacts: false }, "icloud");
-    const fallback = account(fallbackAccountId, "Mail-only fallback", "fallback@example.com", { mail: true, calendar: false, contacts: false });
-    const vault = await commitAccountDraft(environment, setDraftDefault(addDraftAccount(newAccountDraft(target), fallback), fallbackAccountId));
+    const vault = await commitAccountDraft(environment, newAccountDraft(target));
     const props: MailAuthProps = {
       userId: vault.userId,
+      accountVersion: 3,
       scopes: ["mail.read", "calendar.read", "calendar.write"],
     };
     const handler = createMcpHandler(
@@ -304,7 +303,7 @@ describe("MCP email-to-calendar workflow regression", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     try {
-      const message = await callTool<MessageResult>(handler, 1, "get_message", { accountId, mailbox, uid }, environment);
+      const message = await callTool<MessageResult>(handler, 1, "get_message", { mailbox, uid }, environment);
       expect(message.account).toMatchObject({ accountId });
       expect(message.metadata).toMatchObject({ uid, attachments: [{ part: attachmentPart, filename: "hospices-ticket.pdf" }] });
       expect(message.text).toContain("2026-09-14");
@@ -312,13 +311,13 @@ describe("MCP email-to-calendar workflow regression", () => {
       expect(message.text).toContain("Hospices de Beaune");
       expect(message.attachments).toEqual([expect.objectContaining({ part: attachmentPart, filename: "hospices-ticket.pdf", contentBase64: ticketBase64 })]);
 
-      const attachment = await callTool<AttachmentResult>(handler, 2, "get_attachment", { accountId, mailbox, uid, part: attachmentPart }, environment);
+      const attachment = await callTool<AttachmentResult>(handler, 2, "get_attachment", { mailbox, uid, part: attachmentPart }, environment);
       expect(attachment).toMatchObject({ account: { accountId }, uid, part: attachmentPart, filename: "hospices-ticket.pdf", contentBase64: ticketBase64, size: ticket.byteLength });
       expect(fetchMetadata).toHaveBeenCalledTimes(2);
       expect(fetchRaw).toHaveBeenCalledTimes(1);
       expect(fetchBodyPart).toHaveBeenCalledTimes(1);
 
-      const calendars = await callTool<CalendarsResult>(handler, 3, "list_calendars", { accountId }, environment);
+      const calendars = await callTool<CalendarsResult>(handler, 3, "list_calendars", {}, environment);
       expect(calendars.account).toMatchObject({ accountId });
       expect(calendars.calendars).toEqual([expect.objectContaining({
         href: "https://caldav.icloud.com/calendars/hospices/",
@@ -328,7 +327,6 @@ describe("MCP email-to-calendar workflow regression", () => {
       const calendarHref = calendars.calendars[0].href as string;
 
       const created = await callTool<CalendarItemResult>(handler, 4, "create_calendar_item", {
-        accountId,
         calendarHref,
         componentType: "VEVENT",
         rawIcalendar: eventRaw,

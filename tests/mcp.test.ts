@@ -101,7 +101,7 @@ describe("stateless MCP handler", () => {
       result?: { tools?: Array<{ name: string; annotations?: Record<string, unknown> }> };
     };
     const tools = listing.result?.tools ?? [];
-    expect(tools.find((tool) => tool.name === "list_accounts")?.annotations).toMatchObject({ readOnlyHint: true });
+    expect(tools.find((tool) => tool.name === "get_account")?.annotations).toMatchObject({ readOnlyHint: true });
     expect(tools.find((tool) => tool.name === "send_email")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: true });
     expect(tools.find((tool) => tool.name === "list_calendars")?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
     expect(tools.find((tool) => tool.name === "create_calendar_item")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false });
@@ -121,7 +121,7 @@ describe("stateless MCP handler", () => {
     expect(denied.result?.content?.[0]?.text).toContain("Missing required scope: calendar.read");
   });
 
-  it("advertises account selection on every resource tool and lists a v2 account vault", async () => {
+  it("omits account selection and returns the connected account", async () => {
     const kv = new MemoryKv();
     const environment = testEnv(kv as unknown as KVNamespace);
     const configured = {
@@ -144,45 +144,40 @@ describe("stateless MCP handler", () => {
         smtpPassword: "app-password",
       },
     };
-    const vault = await commitAccountDraft(environment, newAccountDraft(configured));
-    const v2Props = { userId: vault.userId, scopes: ["mail.read", "calendar.read", "contacts.read"] };
+    const record = await commitAccountDraft(environment, newAccountDraft(configured));
+    const accountProps = { userId: record.userId, accountVersion: 3 as const, scopes: ["mail.read", "calendar.read", "contacts.read"] };
     const handler = createMcpHandler(
-      () => createMailServer(environment, v2Props),
-      { route: "/mcp", legacy: "stateless", authContext: { props: { ...v2Props } } },
+      () => createMailServer(environment, accountProps),
+      { route: "/mcp", legacy: "stateless", authContext: { props: { ...accountProps } } },
     );
     const listing = await sseJson(await rpc(handler, { jsonrpc: "2.0", id: 20, method: "tools/list", params: {} }, environment)) as {
       result?: { tools?: Array<{ name: string; inputSchema?: { properties?: Record<string, unknown> } }> };
     };
     for (const tool of listing.result?.tools ?? []) {
-      if (tool.name !== "list_accounts") expect(tool.inputSchema?.properties).toHaveProperty("accountId");
+      expect(tool.inputSchema?.properties ?? {}).not.toHaveProperty("accountId");
     }
 
     const response = await rpc(handler, {
       jsonrpc: "2.0",
       id: 21,
       method: "tools/call",
-      params: { name: "list_accounts", arguments: {} },
+      params: { name: "get_account", arguments: {} },
     }, environment);
     const result = await sseJson(response) as { result?: { content?: Array<{ text?: string }> } };
-    const value = JSON.parse(result.result?.content?.[0]?.text ?? "{}") as { defaultAccountId?: string; accounts?: unknown[] };
-    expect(value.defaultAccountId).toBe(configured.accountId);
-    expect(value.accounts).toEqual([expect.objectContaining({ label: "Personal", isDefault: true })]);
+    const value = JSON.parse(result.result?.content?.[0]?.text ?? "{}") as { accountId?: string; label?: string };
+    expect(value.accountId).toBe(configured.accountId);
+    expect(value.label).toBe("Personal");
     expect(JSON.stringify(value)).not.toContain("app-password");
   });
 
   it("invokes a DAV tool through the stateless handler with the encrypted credential record", async () => {
     const kv = new MemoryKv();
     const environment = testEnv(kv as unknown as KVNamespace);
-    const credentialId = await storeMailCredentials(environment, {
-      email: "owner@icloud.com",
-      imapUser: "owner",
-      appPassword: "app-password",
-    });
-    const userProps: MailAuthProps = {
-      userId: credentialId,
-      credentialId,
-      scopes: ["calendar.read"],
-    };
+    const draft = (await import("../src/accounts")).findAccountDraftByEmail;
+    await storeMailCredentials(environment, { email: "owner@icloud.com", imapUser: "owner", appPassword: "app-password" });
+    const saved = await draft(environment, "owner@icloud.com");
+    const record = await commitAccountDraft(environment, saved!);
+    const userProps: MailAuthProps = { userId: record.userId, accountVersion: 3, scopes: ["calendar.read"] };
     const responses = [
       new Response(`<d:multistatus xmlns:d="DAV:"><d:response><d:href>/principal/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/principal/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`),
       new Response(`<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/principal/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/calendars/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`),

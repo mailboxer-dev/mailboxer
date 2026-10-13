@@ -235,8 +235,8 @@ const journey = [
     icon: Mail,
   },
   {
-    title: "Connect the accounts you want",
-    body: "Sign in, choose mail, calendar, or contacts, and add more than one account if you like.",
+    title: "Connect your account",
+    body: "Sign in and choose mail, calendar, or contacts. Add a separate connection for each account.",
     icon: ContactRound,
   },
   {

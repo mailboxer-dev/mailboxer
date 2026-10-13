@@ -1,6 +1,6 @@
 import type { AuthRequest, CompleteAuthorizationOptions, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { describe, expect, it, vi } from "vitest";
-import { AccountVaultError, commitAccountDraft, newAccountDraft, type AccountSubmission } from "../src/accounts";
+import { AccountError, commitAccountDraft, newAccountDraft, type AccountSubmission } from "../src/accounts";
 import { createCredentialAuthHandler, type CredentialAuthDependencies } from "../src/auth";
 import { decodeAuthPageModel, decodeUiPageModel, type AuthPageModel } from "../src/auth-ui";
 import { MailCredentialError } from "../src/credentials";
@@ -56,29 +56,6 @@ function account(seed = "primary"): StoredMailAccount {
       smtpTlsMode: "starttls",
       smtpUser: `${seed}@icloud.com`,
       smtpPassword: "app-password",
-    },
-  };
-}
-
-function customAccount(): StoredMailAccount {
-  return {
-    accountId: "acct_customxxxxxxxxxxxxxxxx",
-    label: "Work",
-    preset: "custom",
-    address: "person@example.com",
-    capabilities: { mail: true, calendar: false, contacts: false },
-    config: {
-      email: "person@example.com",
-      imapUser: "incoming-user",
-      password: "incoming-password",
-      imapHost: "imap.example.com",
-      imapPort: 993,
-      imapTlsMode: "implicit",
-      smtpHost: "smtp.example.com",
-      smtpPort: 587,
-      smtpTlsMode: "starttls",
-      smtpUser: "outgoing-user",
-      smtpPassword: "outgoing-password",
     },
   };
 }
@@ -295,12 +272,12 @@ describe("public onboarding routes", () => {
   });
 });
 
-describe("multi-account OAuth authorization", () => {
-  it("narrows v2 and legacy props to the access token scope", () => {
+describe("single-account OAuth authorization", () => {
+  it("narrows single-account and legacy props to the access token scope", () => {
     expect(restrictMailPropsToTokenScope(
-      { userId: "usr_test", scopes: ["mail.read", "mail.write"] },
+      { userId: "usr_test", accountVersion: 3, scopes: ["mail.read", "mail.write"] },
       ["mail.read", "offline_access"],
-    )).toEqual({ userId: "usr_test", scopes: ["mail.read"] });
+    )).toEqual({ userId: "usr_test", accountVersion: 3, scopes: ["mail.read"] });
     expect(restrictMailPropsToTokenScope(
       { userId: "icloud-test", credentialId: "icloud-test", scopes: ["mail.read"] },
       ["mail.read"],
@@ -416,7 +393,7 @@ describe("multi-account OAuth authorization", () => {
       carddav_url: "https://dav.example.com/contacts/",
     }), environment, context);
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(302);
     expect(verify.mock.calls[0]?.[1]).toMatchObject({
       enableCalendar: true,
       enableContacts: true,
@@ -425,7 +402,7 @@ describe("multi-account OAuth authorization", () => {
     });
   });
 
-  it("discovers and verifies every available service before opening the account list", async () => {
+  it("discovers and verifies every available service before completing authorization", async () => {
     const discover = vi.fn(async (address: string) => discoveredSettings(address));
     const verify = vi.fn(async (_env: AppEnv, submission: AccountSubmission) => ({
       ...account(),
@@ -445,9 +422,7 @@ describe("multi-account OAuth authorization", () => {
     await authFetch(lookupForm(state, cookie, "person@example.com"), environment, context);
 
     const response = await authFetch(discoverForm(state, cookie), environment, context);
-    const model = await pageModel(response);
-    expect(response.status).toBe(200);
-    expect(model.kind).toBe("management");
+    expect(response.status).toBe(302);
     expect(discover).toHaveBeenCalledWith("person@example.com");
     expect(verify.mock.calls[0]?.[1]).toMatchObject({
       preset: "custom",
@@ -470,7 +445,7 @@ describe("multi-account OAuth authorization", () => {
     const environment = oauthEnv();
     const authFetch = authFetchFor({
       discoverAccountSettings: vi.fn(async (address: string) => discoveredSettings(address)),
-      verifyAccountSubmission: vi.fn(async () => { throw new AccountVaultError("We couldn't connect calendar"); }),
+      verifyAccountSubmission: vi.fn(async () => { throw new AccountError("We couldn't connect calendar"); }),
     });
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
@@ -496,49 +471,22 @@ describe("multi-account OAuth authorization", () => {
     expect(body).not.toContain("account-password");
   });
 
-  it("creates an encrypted draft, commits it on Continue, and issues opaque v2 props", async () => {
+  it("connects immediately after verification and issues single-account props", async () => {
     const kv = new MemoryKv();
     const complete = vi.fn(async (_options: CompleteAuthorizationOptions) => ({ redirectTo: "http://127.0.0.1:6274/oauth/callback?code=issued" }));
     const environment = oauthEnv({ kv, complete });
     const authFetch = authFetchFor({ verifyAccountSubmission: vi.fn(async () => account()) });
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
-
-    const details = await authFetch(lookupForm(state, cookie), environment, context);
-    const detailsPage = await pageModel(details);
-    expect(detailsPage.kind).toBe("account-form");
-    if (detailsPage.kind === "account-form") expect(detailsPage.step).toBe("new-password");
-
-    const verified = await authFetch(initialAccountForm(state, cookie), environment, context);
-    expect(verified.status).toBe(200);
-    const managementCsp = verified.headers.get("Content-Security-Policy") ?? "";
-    expect(managementCsp).toContain("form-action 'self' http://127.0.0.1:6274");
-    expect(managementCsp).not.toContain("/callback");
-    expect(managementCsp).not.toContain("tenant=one");
-    const verifiedPage = await pageModel(verified);
-    expect(verifiedPage.kind).toBe("management");
-    expect(verifiedPage.message?.text).toContain("Account added");
-    expect([...kv.values.values()].join("\n")).not.toContain("app-password");
-    expect([...kv.values.keys()]).toEqual(expect.arrayContaining([
-      `mail-oauth:state:${state}`,
-      `mail:account-draft:v2:${state}`,
-    ]));
-
-    const response = await authFetch(post(state, cookie, { action: "continue" }, ["mail.read", "offline_access"]), environment, context);
+    const response = await authFetch(initialAccountForm(state, cookie), environment, context);
     expect(response.status).toBe(302);
     expect(response.headers.get("Location")).toContain("code=issued");
     expect(response.headers.get("Set-Cookie")).toContain("Max-Age=0");
-    expect(complete).toHaveBeenCalledOnce();
     const options = complete.mock.calls[0][0];
-    expect(options.userId).toMatch(/^usr_/u);
-    expect(options.scope).toEqual(["mail.read", "mail.write", "offline_access"]);
-    expect(options.props).toEqual({ userId: options.userId, scopes: ["mail.read", "mail.write"] });
-    expect(JSON.stringify(options.props)).not.toContain("icloud.com");
-    expect([...kv.values.keys()].some((key) => key.startsWith("mail-oauth:state:"))).toBe(false);
-    expect([...kv.values.keys()].some((key) => key.startsWith("mail:account-draft:v2:"))).toBe(false);
-    expect([...kv.values.keys()].some((key) => key.startsWith("mail:account-vault:v2:"))).toBe(true);
-    expect([...kv.values.keys()].some((key) => key.startsWith("mail:account-index:v2:"))).toBe(true);
-    expect([...kv.values.keys()].some((key) => key.startsWith("mail:account-email-index:v2:"))).toBe(true);
+    expect(options.props).toEqual({ userId: options.userId, accountVersion: 3, scopes: ["mail.read", "mail.write"] });
+    expect([...kv.values.values()].join(" ")).not.toContain("app-password");
+    expect([...kv.values.keys()].some(key => key.startsWith("mail:account:v3:"))).toBe(true);
+    expect(kv.values.has(`mail-oauth:state:${state}`)).toBe(false);
   });
 
   it("unlocks an existing profile by matching the saved password without live verification", async () => {
@@ -554,7 +502,6 @@ describe("multi-account OAuth authorization", () => {
     expect(passwordPage.kind).toBe("account-form");
     if (passwordPage.kind === "account-form") {
       expect(passwordPage.step).toBe("password");
-      expect(passwordPage.accountId).toBe(vault.defaultAccountId);
       expect(passwordPage.account.address).toBe("primary@icloud.com");
       expect(JSON.stringify(passwordPage)).not.toContain("imap.mail.me.com");
       expect(JSON.stringify(passwordPage)).not.toContain("smtp.mail.me.com");
@@ -562,15 +509,9 @@ describe("multi-account OAuth authorization", () => {
     }
     expect(verify).not.toHaveBeenCalled();
 
-    const response = await authFetch(unlockForm(state, cookie, vault.defaultAccountId), environment, context);
-    const model = await pageModel(response);
-    expect(response.status).toBe(200);
-    expect(model.kind).toBe("management");
-    if (model.kind === "management") expect(model.accounts[0]?.label).toBe("Personal");
-    expect(model.message?.text).toContain("signed in");
-    expect(model.title).toBe("Your accounts");
+    const response = await authFetch(unlockForm(state, cookie, vault.account.accountId), environment, context);
+    expect(response.status).toBe(302);
     expect(verify).not.toHaveBeenCalled();
-    expect(JSON.stringify(model)).not.toContain(vault.userId);
   });
 
   it("rejects a wrong saved password without live verification", async () => {
@@ -583,119 +524,27 @@ describe("multi-account OAuth authorization", () => {
     const { state, cookie } = stateAndCookie(authorize);
     await authFetch(lookupForm(state, cookie), environment, context);
 
-    const response = await authFetch(unlockForm(state, cookie, vault.defaultAccountId, "wrong-password"), environment, context);
+    const response = await authFetch(unlockForm(state, cookie, vault.account.accountId, "wrong-password"), environment, context);
     expect(response.status).toBe(401);
     expect((await pageModel(response)).message?.text).toContain("password didn't work");
     expect(verify).not.toHaveBeenCalled();
   });
 
-  it("reuses the saved iCloud password while live-verifying an account edit", async () => {
-    const kv = new MemoryKv();
-    const environment = oauthEnv({ kv });
-    const vault = await commitAccountDraft(environment, newAccountDraft(account()));
-    const verify = vi.fn(async (_env, submission) => ({
-      ...account(),
-      accountId: vault.defaultAccountId,
-      label: submission.label,
-    }));
-    const authFetch = authFetchFor({ verifyAccountSubmission: verify });
-    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
-    const { state, cookie } = stateAndCookie(authorize);
+  it("lets a returning user verify a changed password and reconnect the same account", async () => {
+    const environment = oauthEnv();
+    const saved = await commitAccountDraft(environment, newAccountDraft(account()));
+    const verify = vi.fn(async () => ({ ...account(), config: { ...account().config, password: "new-password", smtpPassword: "new-password" } }));
+    const complete = vi.fn(async (_options: CompleteAuthorizationOptions) => ({ redirectTo: "http://127.0.0.1:6274/oauth/callback?code=updated" }));
+    environment.OAUTH_PROVIDER.completeAuthorization = complete;
+    const authFetch = authFetchFor({ verifyAccountSubmission: verify, discoverAccountSettings: vi.fn(async () => discoveredSettings("primary@icloud.com")) });
+    const { state, cookie } = stateAndCookie(await authFetch(new Request("https://mcp.example/authorize"), environment, context));
     await authFetch(lookupForm(state, cookie), environment, context);
-    await authFetch(unlockForm(state, cookie, vault.defaultAccountId), environment, context);
-    await authFetch(post(state, cookie, { action: "edit", account_id: vault.defaultAccountId }), environment, context);
-
-    const response = await authFetch(post(state, cookie, {
-      action: "verify",
-      target: "edit",
-      account_id: vault.defaultAccountId,
-      preset: "icloud",
-      label: "Renamed",
-      address: "primary@icloud.com",
-      service_options_present: "1",
-      enable_mail: "1",
-    }), environment, context);
-
-    expect(response.status).toBe(200);
+    const passwordPage = await authFetch(post(state, cookie, { action: "new_password" }), environment, context);
+    expect((await pageModel(passwordPage)).step).toBe("new-password");
+    const response = await authFetch(discoverForm(state, cookie, "primary@icloud.com", "new-password"), environment, context);
+    expect(response.status).toBe(302);
+    expect(complete.mock.calls[0][0].props).toMatchObject({ userId: saved.userId, accountVersion: 3 });
     expect(verify).toHaveBeenCalledOnce();
-    expect(verify.mock.calls[0]?.[1].appPassword).toBe("app-password");
-    const model = await pageModel(response);
-    expect(model.kind).toBe("management");
-    if (model.kind === "management") expect(model.accounts[0]?.label).toBe("Renamed");
-  });
-
-  it.each([
-    {
-      name: "neither password is replaced",
-      passwordFields: {},
-      expectedIncoming: "incoming-password",
-      expectedOutgoing: "outgoing-password",
-    },
-    {
-      name: "only the incoming password is replaced",
-      passwordFields: { imap_password: "new-incoming-password" },
-      expectedIncoming: "new-incoming-password",
-      expectedOutgoing: "outgoing-password",
-    },
-    {
-      name: "only the outgoing password is replaced",
-      passwordFields: { smtp_password: "new-outgoing-password" },
-      expectedIncoming: "incoming-password",
-      expectedOutgoing: "new-outgoing-password",
-    },
-  ])("preserves custom account credentials when $name", async ({ passwordFields, expectedIncoming, expectedOutgoing }) => {
-    const credentialsKv = new MemoryKv();
-    const environment = oauthEnv({ kv: credentialsKv });
-    const savedAccount = customAccount();
-    const vault = await commitAccountDraft(environment, newAccountDraft(savedAccount));
-    const verify = vi.fn(async (_env, submission: AccountSubmission) => ({
-      ...savedAccount,
-      accountId: vault.defaultAccountId,
-      label: submission.label,
-      config: {
-        ...savedAccount.config,
-        password: submission.imapPassword ?? "",
-        smtpPassword: submission.smtpPassword ?? "",
-      },
-    }));
-    const authFetch = authFetchFor({ verifyAccountSubmission: verify });
-    const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
-    const { state, cookie } = stateAndCookie(authorize);
-    await authFetch(lookupForm(state, cookie, savedAccount.address), environment, context);
-    await authFetch(unlockForm(state, cookie, vault.defaultAccountId, savedAccount.config.password), environment, context);
-    await authFetch(post(state, cookie, { action: "edit", account_id: vault.defaultAccountId }), environment, context);
-
-    const response = await authFetch(post(state, cookie, {
-      action: "verify",
-      target: "edit",
-      account_id: vault.defaultAccountId,
-      preset: "custom",
-      label: "Renamed work account",
-      address: savedAccount.address,
-      service_options_present: "1",
-      enable_mail: "1",
-      custom_fields_present: "1",
-      imap_host: savedAccount.config.imapHost,
-      imap_port: String(savedAccount.config.imapPort),
-      imap_tls_mode: savedAccount.config.imapTlsMode,
-      imap_user: savedAccount.config.imapUser,
-      smtp_host: savedAccount.config.smtpHost,
-      smtp_port: String(savedAccount.config.smtpPort),
-      smtp_tls_mode: savedAccount.config.smtpTlsMode,
-      smtp_user: savedAccount.config.smtpUser,
-      ...(passwordFields as Record<string, string>),
-    }), environment, context);
-
-    expect(response.status).toBe(200);
-    expect(verify).toHaveBeenCalledOnce();
-    expect(verify.mock.calls[0]?.[1]).toMatchObject({
-      imapPassword: expectedIncoming,
-      smtpPassword: expectedOutgoing,
-      sameSmtpCredentials: false,
-    });
-    const model = await pageModel(response);
-    expect(model.kind).toBe("management");
-    if (model.kind === "management") expect(model.accounts[0]?.label).toBe("Renamed work account");
   });
 
   it("returns a generic verification error and enforces the five-attempt limit", async () => {
@@ -725,13 +574,14 @@ describe("multi-account OAuth authorization", () => {
     const authorize = await authFetch(new Request("https://mcp.example/authorize"), environment, context);
     const { state, cookie } = stateAndCookie(authorize);
     await authFetch(lookupForm(state, cookie), environment, context);
-    await authFetch(initialAccountForm(state, cookie), environment, context);
+    await commitAccountDraft(environment, newAccountDraft(account()));
+    await authFetch(lookupForm(state, cookie), environment, context);
     const denied = await authFetch(post(state, cookie, { decision: "deny" }, []), environment, context);
     expect(denied.status).toBe(302);
     expect(denied.headers.get("Location")).toContain("error=access_denied");
     expect(kv.values.has("mail:credentials:v1:sentinel")).toBe(true);
     expect([...kv.values.keys()].some((key) => key.startsWith("mail-oauth:state:"))).toBe(false);
-    expect([...kv.values.keys()].some((key) => key.startsWith("mail:account-draft:v2:"))).toBe(false);
+    expect([...kv.values.keys()].some((key) => key.startsWith("mail:account-draft:v3:"))).toBe(false);
   });
 
   it("returns a configuration error when the encryption secret is invalid", async () => {

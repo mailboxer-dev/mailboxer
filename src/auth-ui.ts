@@ -1,4 +1,4 @@
-export type AccountFormTarget = "start" | "add" | "edit";
+export type AccountFormTarget = "start";
 export type AccountFormStep = "email" | "password" | "new-password" | "config";
 export type AccountPreset = "icloud" | "custom";
 export type TlsMode = "implicit" | "starttls";
@@ -64,31 +64,13 @@ interface AuthPageBase {
   };
 }
 
-export type AuthPageModel =
-  | (AuthPageBase & {
-      kind: "account-form";
-      state: string;
-      target: AccountFormTarget;
-      step: AccountFormStep;
-      accountId?: string;
-      account: AccountFormModel;
-    })
-  | (AuthPageBase & {
-      kind: "management";
-      state: string;
-      accounts: Array<{
-        accountId: string;
-        label: string;
-        address: string;
-        preset: AccountPreset;
-        capabilities: {
-          mail: boolean;
-          calendar: boolean;
-          contacts: boolean;
-        };
-        isDefault: boolean;
-      }>;
-    });
+export type AuthPageModel = AuthPageBase & {
+  kind: "account-form";
+  state: string;
+  target: AccountFormTarget;
+  step: AccountFormStep;
+  account: AccountFormModel;
+};
 
 export type UiPageModel = LandingPageModel | AuthPageModel;
 

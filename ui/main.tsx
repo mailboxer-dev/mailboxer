@@ -2,14 +2,9 @@ import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   CalendarDays,
-  Cloud,
   ContactRound,
   Info,
   Mail,
-  Pencil,
-  Plus,
-  Server,
-  Trash2,
 } from "lucide-react";
 import type {
   AuthPageModel,
@@ -18,14 +13,11 @@ import type {
 } from "../src/auth-ui";
 import { decodeUiPageModel } from "../src/auth-ui";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
-  CardAction,
   CardContent,
   CardDescription,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -84,15 +76,11 @@ function ApplePasswordHelp({ includeWarning = false }: { includeWarning?: boolea
 }
 
 function PageFrame({ page, children }: { page: AuthPageModel; children: React.ReactNode }) {
-  const description = page.kind === "management"
-    ? "Review your accounts, make any changes, then save when you're done."
-    : page.step === "email"
-      ? "Start with the email address you want to connect."
-      : page.step === "password"
-        ? `Enter the password for ${page.account.address} to open your saved accounts.`
-        : page.target === "edit"
-          ? `Update the settings for ${page.account.address}.`
-          : `Finish setting up ${page.account.address}.`;
+  const description = page.step === "email"
+    ? "Start with the email address you want to connect."
+    : page.step === "password"
+      ? `Enter the password for ${page.account.address} to connect this account.`
+      : `Finish setting up ${page.account.address}.`;
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-3xl items-center px-4 py-8 sm:px-6 sm:py-12">
       <div className="w-full">
@@ -180,11 +168,8 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
   const [sameSmtp, setSameSmtp] = useState(page.account.smtp.sameCredentials);
   const [imapTls, setImapTls] = useState(page.account.imap.tlsMode);
   const [smtpTls, setSmtpTls] = useState(page.account.smtp.tlsMode);
-  const [editingAppPassword, setEditingAppPassword] = useState(page.target !== "edit");
   const [appPassword, setAppPassword] = useState("");
-  const [editingImapPassword, setEditingImapPassword] = useState(page.target !== "edit");
   const [imapPassword, setImapPassword] = useState("");
-  const [editingSmtpPassword, setEditingSmtpPassword] = useState(page.target !== "edit");
   const [smtpPassword, setSmtpPassword] = useState("");
   const isCustom = page.account.preset === "custom";
   const defaultLabel = page.account.label || (isCustom ? page.account.address.split("@")[0] || "Email" : "iCloud");
@@ -211,7 +196,7 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
                   required
                 />
                 <FieldDescription>
-                  Already connected an account? Enter that email address first to open your saved account list.
+                  Enter a previously connected email to sign in using its saved settings.
                 </FieldDescription>
               </Field>
             </FieldGroup>
@@ -222,7 +207,6 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
           </>
         ) : page.step === "password" ? (
           <>
-            <Hidden name="account_id" value={page.accountId ?? ""} />
             <Hidden name="address" value={page.account.address} />
             <FieldGroup className="gap-4">
               <Field>
@@ -234,8 +218,9 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
               </Field>
             </FieldGroup>
             <div className="mt-6 flex flex-col-reverse gap-3 border-t pt-4 sm:flex-row sm:justify-between">
-              <Button type="submit" name="action" value="restart" variant="ghost">Use a different email</Button>
-              <Button type="submit" name="action" value="unlock" size="lg">Continue</Button>
+              <Button type="submit" name="action" value="restart" variant="ghost" formNoValidate>Use a different email</Button>
+              <Button type="submit" name="action" value="new_password" variant="outline" formNoValidate>Use a new password</Button>
+              <Button type="submit" name="action" value="unlock" size="lg">Connect account</Button>
             </div>
           </>
         ) : page.step === "new-password" ? (
@@ -263,7 +248,7 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
               </Field>
             </FieldGroup>
             <div className="mt-6 flex flex-col-reverse gap-3 border-t pt-4 sm:flex-row sm:justify-between">
-              <Button type="submit" name="action" value="restart" variant="ghost">Use a different email</Button>
+              <Button type="submit" name="action" value="restart" variant="ghost" formNoValidate>Use a different email</Button>
               <Button type="submit" name="action" value="discover" size="lg">Continue</Button>
             </div>
           </>
@@ -272,7 +257,6 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
             <Hidden name="onboarding_step" value="config" />
             <Hidden name="preset" value={page.account.preset} />
             <Hidden name="address" value={page.account.address} />
-            {page.accountId ? <Hidden name="account_id" value={page.accountId} /> : null}
 
             <FieldGroup className="gap-4">
               <FieldSet>
@@ -311,29 +295,14 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
                               type="password"
                               autoComplete="current-password"
                               maxLength={256}
-                              placeholder={editingImapPassword ? undefined : "Saved password"}
                               value={imapPassword}
                               onChange={(event) => setImapPassword(event.target.value)}
-                              disabled={!editingImapPassword}
-                              required={editingImapPassword}
+                              required
                             />
-                            {page.target === "edit" ? (
-                              <Button
-                                type="button"
-                                variant="outline"
-                                onClick={() => {
-                                  setImapPassword("");
-                                  setEditingImapPassword((current) => !current);
-                                }}
-                              >
-                                {editingImapPassword ? "Cancel" : "Edit"}
-                              </Button>
-                            ) : null}
+
                           </div>
                           <FieldDescription>
-                            {page.target === "edit" && !editingImapPassword
-                              ? "Your saved password will be used. Enter a new password only if it changed."
-                              : "Use the password for this email account."}
+                            Use the password for this email account.
                           </FieldDescription>
                         </Field>
                       </div>
@@ -348,29 +317,15 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
                           type="password"
                           autoComplete="current-password"
                           maxLength={256}
-                          placeholder={editingAppPassword ? "xxxx-xxxx-xxxx-xxxx" : "Saved password"}
+                          placeholder="xxxx-xxxx-xxxx-xxxx"
                           value={appPassword}
                           onChange={(event) => setAppPassword(event.target.value)}
-                          disabled={!editingAppPassword}
-                          required={editingAppPassword}
+                          required
                         />
-                        {page.target === "edit" ? (
-                          <Button
-                            type="button"
-                            variant="outline"
-                            onClick={() => {
-                              setAppPassword("");
-                              setEditingAppPassword((current) => !current);
-                            }}
-                          >
-                            {editingAppPassword ? "Cancel" : "Edit"}
-                          </Button>
-                        ) : null}
+
                       </div>
                       <FieldDescription>
-                        {page.target === "edit" && !editingAppPassword
-                          ? <>Your saved password will be used. Use a new <a href="https://support.apple.com/102654" target="_blank" rel="noreferrer" className="font-medium text-foreground underline underline-offset-4">app-specific password</a> only if it changed.</>
-                          : <ApplePasswordHelp includeWarning />}
+                        <ApplePasswordHelp includeWarning />
                       </FieldDescription>
                     </Field>
                   )}
@@ -415,29 +370,14 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
                               type="password"
                               autoComplete="current-password"
                               maxLength={256}
-                              placeholder={editingSmtpPassword ? undefined : "Saved password"}
                               value={smtpPassword}
                               onChange={(event) => setSmtpPassword(event.target.value)}
-                              disabled={!editingSmtpPassword}
-                              required={editingSmtpPassword}
+                              required
                             />
-                            {page.target === "edit" ? (
-                              <Button
-                                type="button"
-                                variant="outline"
-                                onClick={() => {
-                                  setSmtpPassword("");
-                                  setEditingSmtpPassword((current) => !current);
-                                }}
-                              >
-                                {editingSmtpPassword ? "Cancel" : "Edit"}
-                              </Button>
-                            ) : null}
+
                           </div>
                           <FieldDescription>
-                            {page.target === "edit" && !editingSmtpPassword
-                              ? "Your saved password will be used. Enter a new password only if it changed."
-                              : "Use the password for outgoing mail."}
+                            Use the password for outgoing mail.
                           </FieldDescription>
                         </Field>
                       </div>
@@ -510,13 +450,9 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
             </FieldGroup>
 
             <div className="mt-6 flex flex-col-reverse gap-3 border-t pt-4 sm:flex-row sm:justify-between">
-              {page.target === "start" ? (
-                <Button type="submit" name="action" value="restart" variant="ghost">Use a different email</Button>
-              ) : (
-                <Button type="submit" name="action" value="list" variant="ghost" formNoValidate>Back to accounts</Button>
-              )}
+              <Button type="submit" name="action" value="restart" variant="ghost" formNoValidate>Use a different email</Button>
               <Button type="submit" name="action" value="verify" size="lg">
-                {page.target === "edit" ? "Save account" : "Add account"}
+                Connect account
               </Button>
             </div>
           </>
@@ -526,71 +462,9 @@ function AccountForm({ page }: { page: Extract<AuthPageModel, { kind: "account-f
   );
 }
 
-function capabilityLabels(account: Extract<AuthPageModel, { kind: "management" }>["accounts"][number]): string[] {
-  return [
-    account.capabilities.mail ? "Mail" : "",
-    account.capabilities.calendar ? "Calendar" : "",
-    account.capabilities.contacts ? "Contacts" : "",
-  ].filter(Boolean);
-}
-
-function ManagementPage({ page }: { page: Extract<AuthPageModel, { kind: "management" }> }) {
-  return (
-    <PageFrame page={page}>
-      <div className="flex flex-col gap-4">
-        {page.accounts.map((account) => (
-          <Card key={account.accountId} className="gap-0 shadow-none">
-            <CardHeader>
-              <div className="flex min-w-0 items-start gap-3">
-                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border bg-muted">
-                  {account.preset === "icloud" ? <Cloud aria-hidden="true" className="size-4" /> : <Server aria-hidden="true" className="size-4" />}
-                </div>
-                <div className="min-w-0">
-                  <CardTitle className="truncate text-base">{account.label}</CardTitle>
-                  <CardDescription className="truncate">{account.address}</CardDescription>
-                </div>
-              </div>
-              {account.isDefault ? <CardAction><Badge>Used by default</Badge></CardAction> : null}
-            </CardHeader>
-            <CardContent className="py-4">
-              <div className="flex flex-wrap gap-2">
-                <Badge variant="outline">{account.preset === "icloud" ? "iCloud" : "Other provider"}</Badge>
-                {capabilityLabels(account).map((capability) => <Badge key={capability} variant="secondary">{capability}</Badge>)}
-              </div>
-            </CardContent>
-            <CardFooter className="flex flex-wrap gap-2">
-              <form method="post" action="/authorize" className="contents">
-                <Hidden name="authorization_state" value={page.state} />
-                <Hidden name="mode" value="manage" />
-                <Hidden name="account_id" value={account.accountId} />
-                <Button type="submit" name="action" value="edit" variant="outline" size="sm">
-                  <Pencil aria-hidden="true" data-icon="inline-start" /> Edit
-                </Button>
-                <Button type="submit" name="action" value="remove" variant="ghost" size="sm">
-                  <Trash2 aria-hidden="true" data-icon="inline-start" /> Delete
-                </Button>
-              </form>
-            </CardFooter>
-          </Card>
-        ))}
-      </div>
-
-      <form method="post" action="/authorize" className="mt-6 flex flex-col-reverse gap-3 border-t pt-5 sm:flex-row sm:items-center">
-        <Hidden name="authorization_state" value={page.state} />
-        <Hidden name="mode" value="manage" />
-        <Button type="submit" name="decision" value="deny" variant="ghost">Cancel</Button>
-        <Button type="submit" name="action" value="add" variant="outline" className="sm:ml-auto">
-          <Plus aria-hidden="true" data-icon="inline-start" /> Add account
-        </Button>
-        <Button type="submit" name="action" value="continue" size="lg">Save and exit</Button>
-      </form>
-    </PageFrame>
-  );
-}
-
 function App({ page }: { page: UiPageModel }) {
   if (page.kind === "landing") return <LandingPage page={page} />;
-  return page.kind === "management" ? <ManagementPage page={page} /> : <AccountForm page={page} />;
+  return <AccountForm page={page} />;
 }
 
 const rootElement = document.getElementById("root");

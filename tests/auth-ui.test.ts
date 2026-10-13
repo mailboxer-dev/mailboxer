@@ -50,12 +50,8 @@ describe("shared UI page models", () => {
 
   it("keeps authorization decoding separate from landing decoding", () => {
     const page: AuthPageModel = {
-      version: 1,
-      kind: "management",
-      clientName: "Test client",
-      title: "Manage accounts",
-      state: "state",
-      accounts: [],
+      version: 1, kind: "account-form", clientName: "Test client", title: "Connect account", state: "state", target: "start", step: "email",
+      account: { preset: "icloud", label: "", address: "", services: { mail: true, calendar: false, contacts: false }, imap: { host: "", port: "993", tlsMode: "implicit", user: "" }, smtp: { host: "", port: "587", tlsMode: "starttls", user: "", sameCredentials: true }, dav: { calendarUrl: "", contactsUrl: "", user: "" } },
     };
     const html = renderUiPage(page);
     const encoded = /data-page="([A-Za-z0-9_-]+)"/u.exec(html)?.[1] ?? "";
